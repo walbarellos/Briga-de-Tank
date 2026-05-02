@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:background="#080C14"
+    android:padding="32dp">
+
+    <TextView
+        android:id="@+id/tvLobbyTitle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="MULTIJOGADOR"
+        android:textColor="#33B5E5"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="8dp"/>
+
+    <TextView
+        android:id="@+id/tvDiag"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Verificando rede..."
+        android:textColor="#88FFFFFF"
+        android:textSize="12sp"
+        android:layout_marginBottom="16dp"/>
+
+    <!-- PLAYER NAME -->
+    <EditText
+        android:id="@+id/etPlayerName"
+        android:layout_width="280dp"
+        android:layout_height="54dp"
+        android:hint="SEU NOME"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#44FFFFFF"
+        android:backgroundTint="#AA66CC"
+        android:textAlignment="center"
+        android:textSize="18sp"
+        android:maxLength="10"
+        android:inputType="textPersonName|textCapCharacters"
+        android:layout_marginBottom="12dp"/>
+
+    <!-- LOBBY WORD -->
+    <EditText
+        android:id="@+id/etLobbyWord"
+        android:layout_width="280dp"
+        android:layout_height="54dp"
+        android:hint="PALAVRA DA SALA"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#44FFFFFF"
+        android:backgroundTint="#33B5E5"
+        android:textAlignment="center"
+        android:textSize="18sp"
+        android:textAllCaps="true"
+        android:inputType="textCapCharacters"
+        android:layout_marginBottom="24dp"/>
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Aguardando dados..."
+        android:textColor="#FFFFFF"
+        android:alpha="0.7"
+        android:textAlignment="center"
+        android:layout_marginBottom="12dp"/>
+
+    <TextView
+        android:id="@+id/tvTimer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#FFBB33"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        android:layout_marginBottom="24dp"/>
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="220dp"
+        android:layout_height="64dp"
+        android:text="CRIAR SALA"
+        android:visibility="gone"
+        android:backgroundTint="#3B6D11"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:textStyle="bold"/>
+
+</LinearLayout>

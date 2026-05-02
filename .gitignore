@@ -1,0 +1,24 @@
+# Gradle
+.gradle/
+build/
+app/build/
+engine/build/
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+.DS_Store
+local.properties
+
+# Heavy Files & Archives
+*.zip
+*.patch
+*.tar.gz
+
+# Project Specific
+docs/
+specs/
+
+# Android build artifacts
+*.apk
+*.aar
