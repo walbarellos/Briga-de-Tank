@@ -1,5 +1,6 @@
-package com.tankbriga.engine.network
+package com.tankbriga.app.network
 
+import com.tankbriga.engine.network.RoomAnnounce
 import android.content.Context
 import android.net.wifi.WifiManager
 import kotlinx.coroutines.*

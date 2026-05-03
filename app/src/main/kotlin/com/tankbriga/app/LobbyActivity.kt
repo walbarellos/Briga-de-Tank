@@ -10,7 +10,7 @@ import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.tankbriga.app.network.NetworkCapabilityProbe
-import com.tankbriga.engine.network.RoomDiscovery
+import com.tankbriga.app.network.RoomDiscovery
 import kotlinx.coroutines.*
 
 /**

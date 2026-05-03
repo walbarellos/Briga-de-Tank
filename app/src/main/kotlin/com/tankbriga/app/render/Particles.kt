@@ -91,6 +91,13 @@ class ParticleSystem(private val maxParticles: Int = 400) {
         }
     }
 
+    fun emitSmoke(x: Float, y: Float, intensity: Int = 1) {
+        repeat(intensity) {
+            val color = Color.argb(120, 200, 200, 200)
+            emit(x, y, (rng.nextFloat() - 0.5f) * 2f, -(rng.nextFloat() * 1.5f), 30 + rng.nextInt(30), color, 4f + rng.nextFloat() * 4f, gravity = -0.05f)
+        }
+    }
+
     private fun emitDebrisShower(x: Float, y: Float, radius: Int) {
         repeat(50) {
             val vx = (rng.nextFloat() - 0.5f) * 12f

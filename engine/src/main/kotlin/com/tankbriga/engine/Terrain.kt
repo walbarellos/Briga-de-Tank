@@ -2,41 +2,57 @@ package com.tankbriga.engine
 
 import java.util.BitSet
 
+enum class Biome { LUSH_VALLEY, MARTIAN_DESERT, FROZEN_TUNDRA, VOLCANIC_CRAG }
+
 /**
  * Represents the destructible game terrain using a BitSet for memory efficiency.
- * Solid pixels are 'true', void pixels are 'false'.
  */
 class Terrain(val width: Int, val height: Int) {
     private val data = BitSet(width * height)
     private val craterCentersX = mutableListOf<Int>()
     private val craterCentersY = mutableListOf<Int>()
     private val craterRadii = mutableListOf<Int>()
+    
+    var currentBiome: Biome = Biome.LUSH_VALLEY
+        private set
 
     fun getCraterCentersX(): List<Int> = craterCentersX
     fun getCraterCentersY(): List<Int> = craterCentersY
     fun getCraterRadii(): List<Int> = craterRadii
 
     /**
-     * Generates a random terrain based on a seed.
-     * Uses a simple layered sine approach for deterministic 1D heightmap.
+     * Generates a themed terrain based on a seed and biome.
      */
-    fun generate(seed: Long) {
+    fun generate(seed: Long, biome: Biome = Biome.LUSH_VALLEY) {
         data.clear()
         craterCentersX.clear()
         craterCentersY.clear()
         craterRadii.clear()
+        currentBiome = biome
         val rng = java.util.Random(seed)
-        val baseHeight = height * 0.6f
-        val variance = height * 0.2f
-        val f1 = 0.01f + rng.nextFloat() * 0.02f
-        val f2 = 0.03f + rng.nextFloat() * 0.04f
+        
+        // Calibrate based on biome
+        val baseHeight = when(biome) {
+            Biome.VOLCANIC_CRAG -> height * 0.55f
+            else -> height * 0.65f
+        }
+        val hillIntensity = when(biome) {
+            Biome.VOLCANIC_CRAG -> height * 0.18f // More aggressive
+            Biome.MARTIAN_DESERT -> height * 0.08f // Flatter
+            else -> height * 0.12f
+        }
+        
+        val f1 = 0.002f + rng.nextFloat() * 0.003f
+        val f2 = 0.008f + rng.nextFloat() * 0.005f
+        val f3 = 0.025f + rng.nextFloat() * 0.015f
 
         for (x in 0 until width) {
             val h = (baseHeight +
-                Math.sin(x.toDouble() * f1).toFloat() * variance +
-                Math.sin(x.toDouble() * f2).toFloat() * (variance * 0.3f)).toInt()
+                Math.sin(x.toDouble() * f1).toFloat() * hillIntensity +
+                Math.sin(x.toDouble() * f2).toFloat() * (hillIntensity * 0.4f) +
+                Math.sin(x.toDouble() * f3).toFloat() * (hillIntensity * 0.15f)).toInt()
 
-            val clampedH = h.coerceIn(0, height - 1)
+            val clampedH = h.coerceIn((height * 0.3f).toInt(), height - 1)
             for (y in clampedH until height) setSolid(x, y, true)
         }
     }
@@ -59,8 +75,6 @@ class Terrain(val width: Int, val height: Int) {
 
     /**
      * Returns a conservative support surface for a tank.
-     * We sample the center and two side columns. If a crater opens below the center,
-     * the tank drops to the lowest available supporting point, Gunbound-style.
      */
     fun stableSurfaceYAt(centerX: Int, tankRadius: Float): Int {
         val samples = intArrayOf(
@@ -76,16 +90,31 @@ class Terrain(val width: Int, val height: Int) {
         return Vector2(sx.toFloat(), stableSurfaceYAt(sx, verticalOffset).toFloat() - verticalOffset)
     }
 
-    /** Erodes a circular area of the terrain and returns how many solid pixels were removed. */
+    /** 
+     * Erodes an area with organic noise (jagged edges) and returns pixels removed.
+     * Use a local RNG seeded by position to maintain determinism.
+     */
     fun circleErode(centerX: Int, centerY: Int, radius: Int): Int {
         craterCentersX.add(centerX)
         craterCentersY.add(centerY)
         craterRadii.add(radius)
+        
         var removed = 0
-        val r2 = radius * radius
-        for (dx in -radius..radius) {
-            for (dy in -radius..radius) {
-                if (dx * dx + dy * dy <= r2) {
+        val r2 = (radius * radius).toFloat()
+        
+        // Use a deterministic seed for the noise based on impact location
+        val rng = java.util.Random((centerX xor centerY).toLong())
+        
+        for (dx in -radius - 5..radius + 5) {
+            for (dy in -radius - 5..radius + 5) {
+                val distSq = (dx * dx + dy * dy).toFloat()
+                
+                // Add noise to the boundary (last 35% of the radius)
+                val noise = if (distSq > r2 * 0.65f) {
+                    rng.nextFloat() * (radius * 3.5f)
+                } else 0f
+                
+                if (distSq <= r2 + noise) {
                     val x = centerX + dx
                     val y = centerY + dy
                     if (isSolid(x, y)) {

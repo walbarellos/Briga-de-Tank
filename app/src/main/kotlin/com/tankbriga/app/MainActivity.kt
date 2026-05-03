@@ -10,7 +10,7 @@ import com.tankbriga.engine.*
 import com.tankbriga.engine.network.LobbySnapshot
 import com.tankbriga.engine.network.PlayerSlot
 import com.tankbriga.engine.network.RejoinSnapshot
-import com.tankbriga.engine.network.RoomDiscovery
+import com.tankbriga.app.network.RoomDiscovery
 import kotlinx.coroutines.*
 
 /**
@@ -41,7 +41,8 @@ class MainActivity : AppCompatActivity() {
             val isRejoin      = intent.getBooleanExtra("IS_REJOIN", false)
 
             val terrain = Terrain(2400, 900)
-            terrain.generate(lobbyWord.hashCode().toLong())
+            val biome = Biome.values().random()
+            terrain.generate(lobbyWord.hashCode().toLong(), biome)
 
             val assignedId = if (mode == "MULTIPLAYER" && !isJoining && !isRejoin) {
                 0.toByte()
@@ -51,6 +52,17 @@ class MainActivity : AppCompatActivity() {
 
             gameState = GameState(lobbyWord, terrain, mutableListOf())
             gameState.addPlayer(assignedId, playerName, isBot = false, color = tankColorForId(assignedId))
+
+            if (mode == "SOLO") {
+                gameState.phase = MatchPhase.PLAYER_TURN
+                // Add 3 random bots with distinct IDs
+                val botNames = listOf("Soldado Recruta", "Sargento Blindado", "General de Aço")
+                botNames.forEachIndexed { i, name ->
+                    // Use simple incremental IDs that don't clash with assignedId
+                    val botId = ((assignedId.toInt() + i + 1) % 8).toByte()
+                    gameState.addPlayer(botId, name, isBot = true, color = tankColorForId(botId))
+                }
+            }
 
             gameView  = GameView(this)
             gameView.setLocalPlayerId(assignedId)

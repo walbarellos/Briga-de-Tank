@@ -112,7 +112,7 @@ class GameplayPacketRouter(
     }
 
     private fun handleAimState(payload: ByteArray) {
-        val aim = decodeJson<AimStatePacket>(payload) ?: return
+        val aim = payload.copyOfRange(1, 8).toAimStatePacket() ?: return
         debugState.lastAimInfo = "P${aim.playerId}:${aim.angle.toInt()}/${aim.power.toInt()}"
         publishDebug()
         onAimState(aim)

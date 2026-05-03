@@ -11,7 +11,7 @@ class TurnManager(
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
 ) {
     companion object {
-        const val TURN_SECONDS = 15
+        const val TURN_SECONDS = 30
     }
 
     private var countdownJob: Job? = null

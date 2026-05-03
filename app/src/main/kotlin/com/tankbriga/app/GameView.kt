@@ -58,6 +58,7 @@ class GameView @JvmOverloads constructor(
     private var pendingShotResolve: ShotResolvePacket? = null
     private val remoteAimAngles = mutableMapOf<Byte, Float>()
     private val remoteAimPowers = mutableMapOf<Byte, Float>()
+    private val visualRemoteAngles = mutableMapOf<Byte, Float>()
     private var lastAimBroadcastMs = 0L
     private var lastBroadcastAngle = -999f
     private var lastBroadcastPower = -999f
@@ -70,6 +71,23 @@ class GameView @JvmOverloads constructor(
     private var hudMessageUntilMs = 0L
     private var lastImpactPoint: Vector2? = null
     private var lastImpactUntilMs = 0L
+
+    private val floatingTexts = mutableListOf<DamageText>()
+
+    data class DamageText(
+        val x: Float,
+        var y: Float,
+        val text: String,
+        val color: Int,
+        var life: Int = 80,
+        val isCritical: Boolean = false,
+        var vy: Float = -2.2f
+    )
+
+    private val damageTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
 
     private val tankRenderer = TankRenderer()
     private var terrainRenderer: TerrainRenderer? = null
@@ -150,6 +168,10 @@ class GameView @JvmOverloads constructor(
     }
 
     fun handleRemoteAction(action: ActionPacket) {
+        if (action.playerId == localPlayerId && action.seq == localShotSeq) {
+            // Already predicted local shot, ignore loopback
+            return
+        }
         post { fireAction(action) }
     }
 
@@ -173,6 +195,11 @@ class GameView @JvmOverloads constructor(
         val oldAngle = remoteAimAngles[packet.playerId]
         remoteAimAngles[packet.playerId] = packet.angle
         remoteAimPowers[packet.playerId] = packet.power
+
+        if (!visualRemoteAngles.containsKey(packet.playerId)) {
+            visualRemoteAngles[packet.playerId] = packet.angle
+        }
+
         if (oldAngle == null || abs(oldAngle - packet.angle) >= 1f) {
             AudioSynthesizer.playTick()
         }
@@ -281,15 +308,16 @@ class GameView @JvmOverloads constructor(
                     }
                     HudControl.AIM -> if (humanTurn) {
                         setAngleFromTouch(y)
+                        applyMagneticSnap() // Hardware compensation
                         showMessage("Mirando: ${currentAngle.toInt()}°", 700)
                     }
                     HudControl.ANGLE_UP -> if (humanTurn) {
-                        startAngleRepeat(1f)
-                        AudioSynthesizer.playTick()
+                        currentAngle = (currentAngle + 1f).coerceIn(5f, 175f)
+                        applyAimPrecision()
                     }
                     HudControl.ANGLE_DOWN -> if (humanTurn) {
-                        startAngleRepeat(-1f)
-                        AudioSynthesizer.playTick()
+                        currentAngle = (currentAngle - 1f).coerceIn(5f, 175f)
+                        applyAimPrecision()
                     }
                     HudControl.START_GAME -> if (state.phase == MatchPhase.LOBBY && isHost) {
                         networkManager?.sendLobbySnapshot(buildLobbySnapshot(state))
@@ -404,6 +432,38 @@ class GameView @JvmOverloads constructor(
         }
     }
 
+    private fun applyAimPrecision() {
+        vibrate(10)
+        updateGhostPath(force = true)
+        broadcastAimState(force = true)
+        AudioSynthesizer.playTick()
+    }
+
+    private fun applyMagneticSnap() {
+        val state = gameState ?: return
+        val myTank = state.players.find { it.id == localPlayerId } ?: return
+        
+        // Use current preview trajectory endpoint
+        val path = ghostPath ?: return
+        if (path.isEmpty()) return
+        val aimEnd = path.last()
+        
+        state.players.filter { it.id != localPlayerId && it.hp > 0 }.forEach { target ->
+            val dist = target.position.distanceTo(aimEnd)
+            if (dist < 60f) { // Increased from 45f for stronger assistance
+                // Gently nudge currentAngle towards the physical angle of the target
+                val dx = target.position.x - myTank.position.x
+                val dy = myTank.position.y - target.position.y
+                val targetAngle = Math.toDegrees(Math.atan2(dy.toDouble(), dx.toDouble())).toFloat()
+                
+                if (abs(currentAngle - targetAngle) < 5f) {
+                    currentAngle = currentAngle + (targetAngle - currentAngle) * 0.22f // 22% pull (stronger)
+                    updateGhostPath(force = true)
+                }
+            }
+        }
+    }
+
     private fun broadcastAimState(force: Boolean = false) {
         val state = gameState ?: return
         val mgr = networkManager ?: return
@@ -411,9 +471,9 @@ class GameView @JvmOverloads constructor(
 
         val now = System.currentTimeMillis()
         if (!force &&
-            now - lastAimBroadcastMs < 80L &&
-            abs(currentAngle - lastBroadcastAngle) < 0.8f &&
-            abs(currentPower - lastBroadcastPower) < 2f
+            now - lastAimBroadcastMs < 50L &&
+            abs(currentAngle - lastBroadcastAngle) < 0.3f &&
+            abs(currentPower - lastBroadcastPower) < 1f
         ) return
 
         lastAimBroadcastMs = now
@@ -460,16 +520,22 @@ class GameView @JvmOverloads constructor(
         val cam = camera ?: return
         val state = gameState ?: return
         cam.mode = when (cam.mode) {
-            CameraMode.GENERAL -> CameraMode.FOCUS
-            CameraMode.FOCUS -> CameraMode.FREE
-            CameraMode.FREE -> CameraMode.GENERAL
-            CameraMode.PROJECTILE -> CameraMode.GENERAL
+            CameraMode.FOLLOW -> CameraMode.OVERVIEW
+            CameraMode.OVERVIEW -> CameraMode.FREE
+            CameraMode.FREE -> CameraMode.FOLLOW
         }
         when (cam.mode) {
-            CameraMode.GENERAL -> cam.fitPoints(state.players.filter { it.hp > 0 }.map { it.position }, padding = 270f)
-            CameraMode.FOCUS -> state.players.find { it.id == state.currentTurnPlayerId }?.let { cam.focusOn(it.position, 1.15f) }
-            CameraMode.FREE -> showMessage("Câmera livre: arraste e faça zoom", 1200)
-            CameraMode.PROJECTILE -> Unit
+            CameraMode.FOLLOW -> {
+                showMessage("Câmera: SEGUIR", 1200)
+                state.players.find { it.id == state.currentTurnPlayerId }?.let { cam.focusOn(it.position, 1.15f) }
+            }
+            CameraMode.OVERVIEW -> {
+                showMessage("Câmera: GERAL", 1200)
+                cam.fitPoints(state.players.filter { it.hp > 0 }.map { it.position }, padding = 270f)
+            }
+            CameraMode.FREE -> {
+                showMessage("Câmera: LIVRE (use pinça para zoom)", 1500)
+            }
         }
         vibrate(24)
     }
@@ -484,8 +550,11 @@ class GameView @JvmOverloads constructor(
         localShotSeq = (localShotSeq + 1).toShort()
         val action = ActionPacket(localPlayerId, (currentAngle * 10).toInt().toShort(), currentPower.toInt().toByte(), 0, 0, localShotSeq)
         broadcastAimState(force = true)
+        
+        // Prediction: Fire immediately
+        fireAction(action)
+        
         networkManager?.sendAction(action)
-        showMessage("Aguardando autorização do host...", 900)
     }
 
     private fun buildLobbySnapshot(state: GameState): LobbySnapshot {
@@ -545,7 +614,8 @@ class GameView @JvmOverloads constructor(
     private fun fireAction(action: ActionPacket) {
         val state = gameState ?: return
         val orchestrator = simulationOrchestrator ?: return
-        
+        val cam = camera ?: return
+
         // Relax checks: if the packet came, show it.
         if (state.phase == MatchPhase.RESULTS) return
         if (state.phase == MatchPhase.FLIGHT && lastShooterId == action.playerId) return
@@ -554,7 +624,12 @@ class GameView @JvmOverloads constructor(
         turnManager?.stopCountdown()
         ghostPath = null
         state.phase = MatchPhase.FLIGHT
-        camera?.mode = CameraMode.PROJECTILE
+
+        // Auto-switch to follow if not in FREE mode
+        if (cam.mode != CameraMode.FREE) {
+            cam.mode = CameraMode.FOLLOW
+        }
+
         activeShotPath = null
         activeShotResult = null
         activeShotIndex = 0
@@ -575,7 +650,6 @@ class GameView @JvmOverloads constructor(
             flightResolvePosted = false
         }
     }
-
     private fun updateFlightAnimation() {
         val state = gameState ?: return
         if (state.phase != MatchPhase.FLIGHT) return
@@ -591,10 +665,14 @@ class GameView @JvmOverloads constructor(
         activeShotIndex = min(path.lastIndex, activeShotIndex + step)
         val projectile = path[activeShotIndex]
         camera?.focusOn(projectile, 1.1f)
+        
+        // Emit smoke during flight
+        particles.emitSmoke(projectile.x, projectile.y, 2)
 
         if (activeShotIndex >= path.lastIndex && !flightResolvePosted) {
             flightResolvePosted = true
-            postDelayed({ resolveImpact(result) }, 450L)
+            // Instant resolution: no more postDelayed(450ms)
+            resolveImpact(result)
         }
     }
 
@@ -753,6 +831,23 @@ class GameView @JvmOverloads constructor(
             camera?.focusOn(impact, 1.45f)
             camera?.triggerShake(24f, 18)
             AudioSynthesizer.playTankHit()
+
+            // Emit floating damage texts
+            packet.tankIds.forEachIndexed { index, id ->
+                val oldHp = state.players.find { it.id == id }?.hp ?: 100
+                val newHp = packet.tankHps.getOrElse(index) { oldHp }
+                val dmg = oldHp - newHp
+                if (dmg > 0) {
+                    val tank = state.players.find { it.id == id } ?: return@forEachIndexed
+                    val isCritical = dmg >= 45 || packet.directTankId == id
+                    val color = if (isCritical) Color.YELLOW else Color.WHITE
+                    val text = if (isCritical) "-$dmg CRÍTICO!" else "-$dmg"
+                    floatingTexts.add(DamageText(tank.position.x, tank.position.y - 20f, text, color, isCritical = isCritical))
+                }
+            }
+            if (packet.shotAngle > 70f) {
+                floatingTexts.add(DamageText(impact.x, impact.y - 60f, "ALTO ÂNGULO!", Color.rgb(255, 120, 100), isCritical = true))
+            }
         }
 
         packet.tankIds.forEachIndexed { index, id ->
@@ -800,8 +895,8 @@ class GameView @JvmOverloads constructor(
     private fun focusCurrentTankSoftly() {
         val state = gameState ?: return
         val tank = state.players.find { it.id == state.currentTurnPlayerId } ?: return
-        camera?.mode = CameraMode.FOCUS
-        camera?.focusOn(tank.position, if (tank.isBot) 1.0f else 1.18f)
+        // Force focus only if it's the player's turn to ensure they aren't lost
+        camera?.focusOn(tank.position, if (tank.isBot) 1.0f else 1.18f, force = (tank.id == localPlayerId))
     }
 
     private fun showTurnBanner() {
@@ -831,8 +926,8 @@ class GameView @JvmOverloads constructor(
         val state = gameState ?: return
         camera = CameraController(width, height).apply {
             setWorldBounds(state.terrain.width, state.terrain.height)
-            mode = CameraMode.GENERAL
-            fitPoints(state.players.map { it.position }, padding = 240f, immediate = true)
+            mode = CameraMode.OVERVIEW
+            fitPoints(state.players.map { it.position }, padding = 240f, immediate = true, force = true)
         }
         
         val skyGradient = LinearGradient(0f, 0f, 0f, height.toFloat(), Color.rgb(4, 8, 16), Color.rgb(20, 30, 60), Shader.TileMode.CLAMP)
@@ -865,9 +960,37 @@ class GameView @JvmOverloads constructor(
         drawActiveProjectile(canvas)
         drawImpactMarker(canvas)
 
+        // Update and draw floating texts
+        val iterator = floatingTexts.iterator()
+        while (iterator.hasNext()) {
+            val ft = iterator.next()
+            ft.y += ft.vy
+            ft.vy += 0.05f // small gravity for the text
+            ft.life--
+            if (ft.life <= 0) {
+                iterator.remove()
+            } else {
+                damageTextPaint.color = ft.color
+                damageTextPaint.alpha = (ft.life.toFloat() / 80f * 255).toInt().coerceIn(0, 255)
+                damageTextPaint.textSize = if (ft.isCritical) 28f else 20f
+                canvas.drawText(ft.text, ft.x, ft.y, damageTextPaint)
+            }
+        }
+
         playersSnapshot.forEach { tank ->
             if (tank.hp > 0) {
-                val aimAngle = if (tank.id == localPlayerId) currentAngle else remoteAimAngles[tank.id] ?: currentAngle
+                val targetAngle = if (tank.id == localPlayerId) currentAngle else remoteAimAngles[tank.id] ?: currentAngle
+                
+                // Smoothing for remote players
+                val aimAngle = if (tank.id == localPlayerId) {
+                    targetAngle
+                } else {
+                    val currentVisual = visualRemoteAngles[tank.id] ?: targetAngle
+                    val nextVisual = currentVisual + (targetAngle - currentVisual) * 0.22f // LERP 22% per frame
+                    visualRemoteAngles[tank.id] = nextVisual
+                    nextVisual
+                }
+                
                 tankRenderer.draw(canvas, tank, tank.color, tank.id == state.currentTurnPlayerId, aimAngle, tank.id == localPlayerId)
             }
         }
@@ -899,23 +1022,26 @@ class GameView @JvmOverloads constructor(
     private fun drawDebugOverlay(canvas: Canvas) {
         if (!debugOverlayEnabled) return
         val text = debugOverlay ?: return
+        val lines = text.lines()
+        val pingLine = lines.firstOrNull { it.contains("RTT=") } ?: return
+        
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(190, 0, 0, 0)
-            style = Paint.Style.FILL
+            color = Color.argb(120, 0, 0, 0)
         }
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(180, 255, 180)
-            textSize = 18f
-            typeface = Typeface.MONOSPACE
+            color = Color.WHITE
+            textSize = 14f * (width / 720f).coerceIn(0.8f, 1.2f)
+            alpha = 140
         }
-        val lines = text.lines()
-        val width = (lines.maxOfOrNull { textPaint.measureText(it) } ?: 0f) + 24f
-        val height = lines.size * 22f + 18f
-        val rect = RectF(12f, 170f, 12f + width, 170f + height)
-        canvas.drawRoundRect(rect, 8f, 8f, paint)
-        lines.forEachIndexed { i, line ->
-            canvas.drawText(line, rect.left + 12f, rect.top + 24f + i * 22f, textPaint)
-        }
+        
+        // Draw only the RTT/Loss line at the top right, under the timer
+        val info = pingLine.substringAfter("RTT=").trim()
+        val display = "PING $info"
+        val tw = textPaint.measureText(display)
+        val s = (width / 720f).coerceIn(0.72f, 1.1f)
+        
+        canvas.drawRoundRect(width - tw - 40f*s, 95f*s, width - 10f*s, 120f*s, 8f*s, 8f*s, paint)
+        canvas.drawText(display, width - tw - 25f*s, 113f*s, textPaint)
     }
 
     private fun drawGhostTrajectory(canvas: Canvas, state: GameState) {

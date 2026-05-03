@@ -12,7 +12,9 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class ReliableUdp(
     private val socket: DatagramSocket,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO),
+    private val onRttMeasured: ((Long) -> Unit)? = null,
+    private val onPacketLost: (() -> Unit)? = null
 ) {
     private val pending = ConcurrentHashMap<Short, PendingPacket>()
     private var retryJob: Job? = null
@@ -22,6 +24,7 @@ class ReliableUdp(
         val target: InetAddress,
         val port: Int,
         val sentAt: Long,
+        val originalSentAt: Long = sentAt,
         var retries: Int = 0
     )
 
@@ -39,13 +42,14 @@ class ReliableUdp(
                     if (p.retries >= 5) {
                         println("ReliableUDP: Packet $seq failed after 5 retries to ${p.target}")
                         pending.remove(seq)
+                        onPacketLost?.invoke()
                         continue
                     }
                     
                     try {
                         socket.send(DatagramPacket(p.payload, p.payload.size, p.target, p.port))
                         p.retries++
-                        // Update sentAt to wait for next interval
+                        // Update sentAt to wait for next interval, but keep originalSentAt for RTT
                         pending[seq] = p.copy(sentAt = now)
                     } catch (e: Exception) {
                         // Socket error
@@ -71,7 +75,11 @@ class ReliableUdp(
      * Call this when an ACK packet is received.
      */
     fun onAckReceived(seq: Short) {
-        pending.remove(seq)
+        val p = pending.remove(seq)
+        if (p != null) {
+            val rtt = System.currentTimeMillis() - p.originalSentAt
+            onRttMeasured?.invoke(rtt)
+        }
     }
 
     fun stop() {

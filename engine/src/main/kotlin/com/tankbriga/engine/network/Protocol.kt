@@ -124,6 +124,30 @@ data class CoordElectedPacket(
     val epoch: Short
 )
 
+// ── Binary serialization para AimStatePacket (7 bytes) ──────────────────────
+
+fun AimStatePacket.toBinary(): ByteArray {
+    val buf = ByteArray(7)
+    buf[0] = playerId
+    val a = (angle * 10).toInt().toShort()
+    buf[1] = (a.toInt() shr 8).toByte()
+    buf[2] = (a.toInt() and 0xFF).toByte()
+    buf[3] = power.toInt().toByte()
+    buf[4] = if (charging) 1.toByte() else 0.toByte()
+    buf[5] = (turnNumber.toInt() shr 8).toByte()
+    buf[6] = (turnNumber.toInt() and 0xFF).toByte()
+    return buf
+}
+
+fun ByteArray.toAimStatePacket(): AimStatePacket? {
+    if (this.size < 7) return null
+    val angle = (((this[1].toInt() and 0xFF) shl 8) or (this[2].toInt() and 0xFF)).toShort() / 10f
+    val power = (this[3].toInt() and 0xFF).toFloat()
+    val charging = this[4].toInt() == 1
+    val turnNumber = (((this[5].toInt() and 0xFF) shl 8) or (this[6].toInt() and 0xFF)).toShort()
+    return AimStatePacket(this[0], angle, power, charging, turnNumber)
+}
+
 // ── Binary serialization para ActionPacket (8 bytes, zero alloc) ─────────────
 
 fun com.tankbriga.engine.ActionPacket.toBinary(): ByteArray {

@@ -1,24 +1,21 @@
 package com.tankbriga.app.render
 
 import android.graphics.*
+import com.tankbriga.engine.Biome
 import com.tankbriga.engine.Terrain
 
 /**
  * Optimized terrain renderer backed by a bitmap.
- * Features a dual-layer look (Grass on top, Soil below) with partial redraws.
+ * Supports dynamic themes based on Biomes.
  */
 class TerrainRenderer(private val terrain: Terrain) {
     private var terrainBitmap: Bitmap? = null
     private var terrainCanvas: Canvas? = null
     
-    private val grassPaint = Paint().apply {
-        setColor(Color.parseColor("#4CAF50"))
-        style = Paint.Style.FILL
-    }
-    private val soilPaint = Paint().apply {
-        setColor(Color.parseColor("#795548"))
-        style = Paint.Style.FILL
-    }
+    private val grassPaint = Paint().apply { style = Paint.Style.FILL }
+    private val soilPaint = Paint().apply { style = Paint.Style.FILL }
+    private val rockPaint = Paint().apply { style = Paint.Style.FILL }
+    
     private val dirtShadePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         setColor(Color.argb(95, 14, 10, 5))
         style = Paint.Style.STROKE
@@ -31,25 +28,46 @@ class TerrainRenderer(private val terrain: Terrain) {
     fun initialize() {
         terrainBitmap = Bitmap.createBitmap(terrain.width, terrain.height, Bitmap.Config.ARGB_8888)
         terrainCanvas = Canvas(terrainBitmap!!)
+        updateColors()
         redrawFull()
     }
 
-    /**
-     * Optimized sync: only redraws the columns affected by an explosion.
-     * If no parameters are provided, it performs a full redraw.
-     */
+    private fun updateColors() {
+        when(terrain.currentBiome) {
+            Biome.LUSH_VALLEY -> {
+                grassPaint.color = Color.parseColor("#7CB342") // Lush Green
+                soilPaint.color = Color.parseColor("#5D4037")  // Earth Brown
+                rockPaint.color = Color.parseColor("#455A64")  // Slate Rock
+            }
+            Biome.MARTIAN_DESERT -> {
+                grassPaint.color = Color.parseColor("#D84315") // Deep Red Dust
+                soilPaint.color = Color.parseColor("#BF360C")  // Martian Soil
+                rockPaint.color = Color.parseColor("#3E2723")  // Dark Volcanic Rock
+            }
+            Biome.FROZEN_TUNDRA -> {
+                grassPaint.color = Color.parseColor("#E0F7FA") // Ice/Snow
+                soilPaint.color = Color.parseColor("#80DEEA")  // Blue Frost
+                rockPaint.color = Color.parseColor("#006064")  // Deep Frozen Stone
+            }
+            Biome.VOLCANIC_CRAG -> {
+                grassPaint.color = Color.parseColor("#212121") // Ash/Obsidian
+                soilPaint.color = Color.parseColor("#4E342E")  // Burnt Earth
+                rockPaint.color = Color.parseColor("#BF360C")  // Molten deep rock
+            }
+        }
+    }
+
     fun syncFromTerrain(centerX: Int? = null, centerY: Int? = null, radius: Int? = null) {
         if (centerX == null || radius == null) {
+            updateColors()
             redrawFull()
             return
         }
 
-        // Partial redraw: only columns in the [centerX - radius, centerX + radius] range
         val canvas = terrainCanvas ?: return
-        val startX = (centerX - radius - 5).coerceIn(0, terrain.width - 1)
-        val endX = (centerX + radius + 5).coerceIn(0, terrain.width - 1)
+        val startX = (centerX - radius - 8).coerceIn(0, terrain.width - 1)
+        val endX = (centerX + radius + 8).coerceIn(0, terrain.width - 1)
         
-        // Clear affected column area
         val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
         canvas.drawRect(startX.toFloat(), 0f, endX + 1f, terrain.height.toFloat(), clearPaint)
 
@@ -69,7 +87,7 @@ class TerrainRenderer(private val terrain: Terrain) {
 
         if (centerY != null) {
             craterMarks += CraterMark(centerX.toFloat(), centerY.toFloat(), radius.toFloat(), 90)
-            while (craterMarks.size > 8) craterMarks.removeAt(0)
+            while (craterMarks.size > 12) craterMarks.removeAt(0)
         }
     }
 
@@ -96,14 +114,18 @@ class TerrainRenderer(private val terrain: Terrain) {
 
     private fun drawColumn(canvas: Canvas, x: Int, startY: Int, endY: Int) {
         val fx = x.toFloat()
-        // Draw Grass (top 8 pixels of a column)
-        val grassHeight = 8
-        val grassEnd = (startY + grassHeight).coerceAtMost(endY)
-        canvas.drawRect(fx, startY.toFloat(), fx + 1f, grassEnd.toFloat(), grassPaint)
+        val grassHeight = 12
+        val soilHeight = 45
         
-        // Draw Soil (the rest)
-        if (grassEnd < endY) {
-            canvas.drawRect(fx, grassEnd.toFloat(), fx + 1f, endY.toFloat(), soilPaint)
+        val grassEnd = (startY + grassHeight).coerceAtMost(endY)
+        val soilEnd = (startY + soilHeight).coerceAtMost(endY)
+        
+        canvas.drawRect(fx, startY.toFloat(), fx + 1f, grassEnd.toFloat(), grassPaint)
+        if (grassEnd < soilEnd) {
+            canvas.drawRect(fx, grassEnd.toFloat(), fx + 1f, soilEnd.toFloat(), soilPaint)
+        }
+        if (soilEnd < endY) {
+            canvas.drawRect(fx, soilEnd.toFloat(), fx + 1f, endY.toFloat(), rockPaint)
         }
     }
 

@@ -34,16 +34,31 @@ class GameState(
     fun humanPlayer(): Tank? = players.firstOrNull { !it.isBot }
 
     /**
-     * Adds a player with deterministic spawn positioning.
-     * Host = ID 0, Peers = IDs 1-7.
+     * Adds a player with distributed random spawn positioning.
+     * Prevents clustering by using high-entropy seeding.
      */
     fun addPlayer(id: Byte, name: String, isBot: Boolean, color: Int): Tank {
         synchronized(players) {
             val existing = players.find { it.id == id }
             if (existing != null) return existing
 
-            val spawnX = terrain.width * (id.toInt() + 1f) / 9f
-            val spawnY = terrain.stableSurfaceYAt(spawnX.toInt(), 10f).toFloat() - 10f
+            // High-Entropy Seeding: mix ID, lobbyWord, nanoTime and a random long
+            val highEntropySeed = (id.toLong() * 31) + 
+                                 lobbyWord.hashCode().toLong() + 
+                                 System.nanoTime() + 
+                                 java.util.Random().nextLong()
+                                 
+            val rng = java.util.Random(highEntropySeed)
+            
+            // Map is 2400px wide. Use a shuffle-based approach to pick a unique zone
+            // for the current players count, but keep it simple for now with a 
+            // wider random range to avoid the 'same sector' feeling.
+            val minX = 100f
+            val maxX = terrain.width - 100f
+            
+            // Pick a truly random X within the full map range
+            val spawnX = (minX + rng.nextFloat() * (maxX - minX)).coerceIn(minX, maxX)
+            val spawnY = terrain.stableSurfaceYAt(spawnX.toInt(), 18f).toFloat() - 18f
 
             val newTank = Tank(id, Vector2(spawnX, spawnY), hp = 100, name = name, isBot = isBot, color = color)
             players.add(newTank)

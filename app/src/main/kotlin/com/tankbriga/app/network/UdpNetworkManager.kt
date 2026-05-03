@@ -30,11 +30,21 @@ class UdpNetworkManager(
     private val deduplicator = PacketDeduplicator()
     private val debugState = NetworkDebugState()
     private val retryBroadcaster = RetryBroadcaster(scope)
-    private val reliableUdp by lazy { transport.socket?.let { ReliableUdp(it, scope) } }
+    private val reliableUdp by lazy { 
+        transport.socket?.let { 
+            ReliableUdp(
+                it, 
+                scope, 
+                onRttMeasured = { rtt -> debugState.updateRtt(rtt) },
+                onPacketLost = { debugState.packetsLost++ }
+            ) 
+        } 
+    }
     private val secureSender = SecurePacketSender(
         transport = transport,
         reliableUdp = { reliableUdp },
-        localPlayerId = { localPlayerId }
+        localPlayerId = { localPlayerId },
+        onPacketSent = { debugState.packetsSent++ }
     )
 
     val coordinator = CoordinatorNode(
@@ -203,7 +213,7 @@ class UdpNetworkManager(
 
     fun sendAimState(packet: AimStatePacket) {
         scope.launch {
-            val payload = ProtocolPayloads.json(PktType.AIM_STATE, packet)
+            val payload = ProtocolPayloads.aimState(packet)
             secureSender.broadcast(payload)
         }
     }

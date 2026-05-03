@@ -8,13 +8,15 @@ import java.net.InetAddress
 class SecurePacketSender(
     private val transport: AndroidUdpTransport,
     private val reliableUdp: () -> ReliableUdp?,
-    private val localPlayerId: () -> Byte
+    private val localPlayerId: () -> Byte,
+    private val onPacketSent: (() -> Unit)? = null
 ) {
     private var localSeq: Short = 0
 
     fun broadcast(payload: ByteArray, reliable: Boolean = false) {
         val seq = nextSeq()
         val data = envelope(payload, seq)
+        onPacketSent?.invoke()
 
         if (reliable) {
             reliableUdp()?.sendReliable(data, transport.reliableGroupAddress(), seq)
@@ -28,6 +30,7 @@ class SecurePacketSender(
     fun sendTo(payload: ByteArray, address: InetAddress, reliable: Boolean = false) {
         val seq = nextSeq()
         val data = envelope(payload, seq)
+        onPacketSent?.invoke()
         if (reliable) reliableUdp()?.sendReliable(data, address, seq)
         else transport.sendTo(data, address)
     }

@@ -24,6 +24,14 @@ object ProtocolPayloads {
         }
     }
 
+    fun aimState(packet: AimStatePacket): ByteArray {
+        val bin = packet.toBinary()
+        return ByteArray(1 + bin.size).also {
+            it[0] = PktType.AIM_STATE.id
+            bin.copyInto(it, 1)
+        }
+    }
+
     fun ack(type: PktType, turnNumber: Short, shotId: Short): ByteArray {
         require(type == PktType.LOBBY_ACK || type == PktType.TURN_ACK || type == PktType.ACTION_ACK || type == PktType.RESOLVE_ACK) {
             "Ack payload must use an ACK packet type"

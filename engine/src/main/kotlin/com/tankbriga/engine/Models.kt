@@ -19,7 +19,7 @@ data class Tank(
     val id: Byte,
     var position: Vector2,
     var hp: Int = 100,
-    val radius: Float = 10f, // Bounding box/circle for collisions
+    val radius: Float = 18f, // Increased from 10f for easier aiming
     val name: String = "P",
     val isBot: Boolean = false,
     val color: Int = 0xFFFFFFFF.toInt()
