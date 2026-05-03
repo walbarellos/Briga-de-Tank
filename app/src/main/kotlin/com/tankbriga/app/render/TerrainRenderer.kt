@@ -3,6 +3,7 @@ package com.tankbriga.app.render
 import android.graphics.*
 import com.tankbriga.engine.Biome
 import com.tankbriga.engine.Terrain
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Optimized terrain renderer backed by a bitmap.
@@ -21,7 +22,7 @@ class TerrainRenderer(private val terrain: Terrain) {
         style = Paint.Style.STROKE
         strokeWidth = 4f
     }
-    private val craterMarks = mutableListOf<CraterMark>()
+    private val craterMarks = CopyOnWriteArrayList<CraterMark>()
 
     private data class CraterMark(val x: Float, val y: Float, val radius: Float, var life: Int)
 
@@ -72,22 +73,16 @@ class TerrainRenderer(private val terrain: Terrain) {
         canvas.drawRect(startX.toFloat(), 0f, endX + 1f, terrain.height.toFloat(), clearPaint)
 
         for (x in startX..endX) {
-            var colStartY: Int? = null
-            for (y in 0 until terrain.height) {
-                val solid = terrain.isSolid(x, y)
-                if (solid && colStartY == null) {
-                    colStartY = y
-                } else if (!solid && colStartY != null) {
-                    drawColumn(canvas, x, colStartY, y)
-                    colStartY = null
-                }
+            // Fix 7 — Start from surfaceCache: O(1) instead of O(height) scan
+            val startY = terrain.surfaceYAt(x)
+            if (startY < terrain.height) {
+                drawColumn(canvas, x, startY, terrain.height)
             }
-            if (colStartY != null) drawColumn(canvas, x, colStartY, terrain.height)
         }
 
         if (centerY != null) {
-            craterMarks += CraterMark(centerX.toFloat(), centerY.toFloat(), radius.toFloat(), 90)
-            while (craterMarks.size > 12) craterMarks.removeAt(0)
+            craterMarks.add(CraterMark(centerX.toFloat(), centerY.toFloat(), radius.toFloat(), 90))
+            if (craterMarks.size > 12) craterMarks.removeAt(0)
         }
     }
 
@@ -98,17 +93,10 @@ class TerrainRenderer(private val terrain: Terrain) {
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
         for (x in 0 until terrain.width) {
-            var startY: Int? = null
-            for (y in 0 until terrain.height) {
-                val solid = terrain.isSolid(x, y)
-                if (solid && startY == null) {
-                    startY = y
-                } else if (!solid && startY != null) {
-                    drawColumn(canvas, x, startY, y)
-                    startY = null
-                }
+            val startY = terrain.surfaceYAt(x)
+            if (startY < terrain.height) {
+                drawColumn(canvas, x, startY, terrain.height)
             }
-            if (startY != null) drawColumn(canvas, x, startY, terrain.height)
         }
     }
 

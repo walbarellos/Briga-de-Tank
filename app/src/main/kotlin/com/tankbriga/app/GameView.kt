@@ -18,6 +18,7 @@ import com.tankbriga.engine.network.LobbySnapshot
 import com.tankbriga.engine.network.PlayerSlot
 import com.tankbriga.engine.network.ShotResolvePacket
 import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -49,6 +50,8 @@ class GameView @JvmOverloads constructor(
     private var lastGhostAngle = -999f
     private var lastGhostPower = -999f
     private var botTurnStarted = -1
+    private var ghostJob: Job? = null
+    private var gameTickJob: Job? = null
 
     private var activeShotPath: List<Vector2>? = null
     private var activeShotResult: ShotResult? = null
@@ -56,9 +59,9 @@ class GameView @JvmOverloads constructor(
     private var flightResolvePosted = false
     private var lastShooterId: Byte = -1
     private var pendingShotResolve: ShotResolvePacket? = null
-    private val remoteAimAngles = mutableMapOf<Byte, Float>()
-    private val remoteAimPowers = mutableMapOf<Byte, Float>()
-    private val visualRemoteAngles = mutableMapOf<Byte, Float>()
+    private val remoteAimAngles = ConcurrentHashMap<Byte, Float>()
+    private val remoteAimPowers = ConcurrentHashMap<Byte, Float>()
+    private val visualRemoteAngles = ConcurrentHashMap<Byte, Float>()
     private var lastAimBroadcastMs = 0L
     private var lastBroadcastAngle = -999f
     private var lastBroadcastPower = -999f
@@ -117,10 +120,21 @@ class GameView @JvmOverloads constructor(
         setColor(Color.rgb(255, 245, 170))
         style = Paint.Style.FILL
     }
+    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        setColor(Color.rgb(255, 255, 200))
+        setAlpha(120)
+    }
     private val impactPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         setColor(Color.rgb(255, 110, 70))
         style = Paint.Style.STROKE
         strokeWidth = 5f
+    }
+    private val debugBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(120, 0, 0, 0)
+    }
+    private val debugTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        alpha = 140
     }
 
     init {
@@ -262,11 +276,14 @@ class GameView @JvmOverloads constructor(
             running = true
             start()
         }
+        startGameTick()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         renderThread?.running = false
         renderThread?.join()
+        gameTickJob?.cancel()
+        ghostJob?.cancel()
         viewScope.cancel()
     }
 
@@ -504,6 +521,7 @@ class GameView @JvmOverloads constructor(
         lastGhostAtMs = now
         lastGhostAngle = currentAngle
         lastGhostPower = previewPower
+        
         val mockAction = ActionPacket(
             localPlayerId,
             (currentAngle * 10).toInt().toShort(),
@@ -512,8 +530,33 @@ class GameView @JvmOverloads constructor(
             0,
             0
         )
-        orchestrator.setWind(state.windState)
-        ghostPath = orchestrator.simulateShot(mockAction).path
+        
+        // Fix 1 — Ghost path assíncrono
+        ghostJob?.cancel()
+        ghostJob = viewScope.launch {
+            val result = withContext(Dispatchers.Default) {
+                orchestrator.setWind(state.windState)
+                orchestrator.simulateShot(mockAction)
+            }
+            ghostPath = result.path
+        }
+    }
+
+    private fun startGameTick() {
+        gameTickJob?.cancel()
+        gameTickJob = viewScope.launch {
+            while (isActive) {
+                val start = System.currentTimeMillis()
+                
+                // Fix 2 — Game loop separado do render thread
+                updateChargePower()
+                maybeAutoPlayBotTurn()
+                updateFlightAnimation()
+                
+                val elapsed = System.currentTimeMillis() - start
+                delay(max(1, 16 - elapsed))
+            }
+        }
     }
 
     private fun toggleCameraMode() {
@@ -745,30 +788,37 @@ class GameView @JvmOverloads constructor(
         }
     }
 
-    private fun resolveExplosion(impactPoint: Vector2, shotType: Byte, shotAngle: Float, directTankId: Byte?, rawResult: ShotResult): ImpactReport? {
-        val state = gameState ?: return null
-        val report = state.applyExplosion(impactPoint, shotType, shotAngle, directTankId)
-        terrainRenderer?.syncFromTerrain(impactPoint.x.toInt(), impactPoint.y.toInt(), report.craterRadius)
-        particles.emitExplosion(impactPoint.x, impactPoint.y, report.craterRadius)
-        lastImpactPoint = impactPoint
-        lastImpactUntilMs = System.currentTimeMillis() + 1700L
+    private fun resolveExplosion(impactPoint: Vector2, shotType: Byte, shotAngle: Float, directTankId: Byte?, rawResult: ShotResult) {
+        val state = gameState ?: return
+        
+        // Fix 3 — resolveExplosion sem freeze no impacto
+        viewScope.launch(Dispatchers.Default) {
+            // circleErode DENTRO do Default também
+            val report = state.applyExplosion(impactPoint, shotType, shotAngle, directTankId)
+            terrainRenderer?.syncFromTerrain(impactPoint.x.toInt(), impactPoint.y.toInt(), report.craterRadius)
+            
+            withContext(Dispatchers.Main) {
+                particles.emitExplosion(impactPoint.x, impactPoint.y, report.craterRadius)
+                lastImpactPoint = impactPoint
+                lastImpactUntilMs = System.currentTimeMillis() + 1700L
 
-        if (report.hitSomeone) {
-            AudioSynthesizer.playTankHit()
-            val hitPlayer = report.damages.any { it.tankId == localPlayerId }
-            if (hitPlayer) vibrate(300) else vibrate(60)
-        } else {
-            AudioSynthesizer.playMiss()
-            vibrate(100)
+                if (report.hitSomeone) {
+                    AudioSynthesizer.playTankHit()
+                    val hitPlayer = report.damages.any { it.tankId == localPlayerId }
+                    if (hitPlayer) vibrate(300) else vibrate(60)
+                } else {
+                    AudioSynthesizer.playMiss()
+                    vibrate(100)
+                }
+
+                if (report.eliminated.isNotEmpty()) AudioSynthesizer.playDeath()
+
+                camera?.focusOn(impactPoint, 1.45f)
+                camera?.triggerShake(if (report.hitSomeone) 30f else 20f, 20)
+                showMessage(feedbackFor(rawResult, report), 2300)
+                maybeBroadcastShotResolve(rawResult, report)
+            }
         }
-
-        if (report.eliminated.isNotEmpty()) AudioSynthesizer.playDeath()
-
-        camera?.focusOn(impactPoint, 1.45f)
-        camera?.triggerShake(if (report.hitSomeone) 30f else 20f, 20)
-        showMessage(feedbackFor(rawResult, report), 2300)
-        maybeBroadcastShotResolve(rawResult, report)
-        return report
     }
 
     private fun maybeBroadcastShotResolve(result: ShotResult, report: ImpactReport?) {
@@ -930,9 +980,16 @@ class GameView @JvmOverloads constructor(
             fitPoints(state.players.map { it.position }, padding = 240f, immediate = true, force = true)
         }
         
+        // Fix 4 — TerrainRenderer inicializado fora do drawGame
+        if (terrainRenderer == null) {
+            terrainRenderer = TerrainRenderer(state.terrain).apply { initialize() }
+        }
+
         val skyGradient = LinearGradient(0f, 0f, 0f, height.toFloat(), Color.rgb(4, 8, 16), Color.rgb(20, 30, 60), Shader.TileMode.CLAMP)
         skyPaint = Paint().apply { shader = skyGradient }
-        stars = List(120) { Vector2((Math.random() * state.terrain.width).toFloat(), (Math.random() * state.terrain.height).toFloat()) }
+        
+        // Fix 9 — Star bitmap screen-space + 6× menor
+        stars = List(120) { Vector2((Math.random() * width).toFloat(), (Math.random() * height).toFloat()) }
     }
 
     private fun vibrate(ms: Long) {
@@ -943,18 +1000,17 @@ class GameView @JvmOverloads constructor(
     fun drawGame(canvas: Canvas) {
         val state = gameState ?: return
         val cam = camera ?: return
-        if (terrainRenderer == null) terrainRenderer = TerrainRenderer(state.terrain).apply { initialize() }
         val playersSnapshot = synchronized(state.players) { state.players.toList() }
 
-        updateChargePower()
-        maybeAutoPlayBotTurn()
-        updateFlightAnimation()
         particles.update()
 
         cam.update()
         skyPaint?.let { canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), it) }
-        cam.applyTransform(canvas)
+        
+        // Fix 9 — Draw stars BEFORE camera transform (screen space)
         stars?.forEach { canvas.drawCircle(it.x, it.y, 1.5f, starPaint) }
+
+        cam.applyTransform(canvas)
         terrainRenderer?.draw(canvas)
         drawGhostTrajectory(canvas, state)
         drawActiveProjectile(canvas)
@@ -1024,24 +1080,18 @@ class GameView @JvmOverloads constructor(
         val text = debugOverlay ?: return
         val lines = text.lines()
         val pingLine = lines.firstOrNull { it.contains("RTT=") } ?: return
-        
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(120, 0, 0, 0)
-        }
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = 14f * (width / 720f).coerceIn(0.8f, 1.2f)
-            alpha = 140
-        }
-        
+
+        // Fix 5 — debugBgPaint e debugTextPaint pré-alocados
+        debugTextPaint.textSize = 14f * (width / 720f).coerceIn(0.8f, 1.2f)
+
         // Draw only the RTT/Loss line at the top right, under the timer
         val info = pingLine.substringAfter("RTT=").trim()
         val display = "PING $info"
-        val tw = textPaint.measureText(display)
+        val tw = debugTextPaint.measureText(display)
         val s = (width / 720f).coerceIn(0.72f, 1.1f)
-        
-        canvas.drawRoundRect(width - tw - 40f*s, 95f*s, width - 10f*s, 120f*s, 8f*s, 8f*s, paint)
-        canvas.drawText(display, width - tw - 25f*s, 113f*s, textPaint)
+
+        canvas.drawRoundRect(width - tw - 40f*s, 95f*s, width - 10f*s, 120f*s, 8f*s, 8f*s, debugBgPaint)
+        canvas.drawText(display, width - tw - 25f*s, 113f*s, debugTextPaint)
     }
 
     private fun drawGhostTrajectory(canvas: Canvas, state: GameState) {
@@ -1063,16 +1113,12 @@ class GameView @JvmOverloads constructor(
         trail.moveTo(path[start].x, path[start].y)
         for (i in start..index) trail.lineTo(path[i].x, path[i].y)
         canvas.drawPath(trail, shotTrailPaint)
-        
+
         val p = path[index]
-        val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { 
-            setColor(Color.rgb(255, 255, 200))
-            setAlpha(120)
-        }
+        // Fix 4 — glowPaint pré-alocado
         canvas.drawCircle(p.x, p.y, 14f, glowPaint)
         canvas.drawCircle(p.x, p.y, 8f, projectilePaint)
     }
-
     private fun drawImpactMarker(canvas: Canvas) {
         val point = lastImpactPoint ?: return
         val remaining = lastImpactUntilMs - System.currentTimeMillis()
