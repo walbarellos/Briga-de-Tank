@@ -22,10 +22,9 @@ TankBriga é um jogo de artilharia multiplayer para Android inspirado no clássi
 
 *Adicione suas fotos do jogo nesta sessão para mostrar o visual de espaço e as batalhas!*
 
-<!-- 
-Exemplo de como adicionar:
-![Gameplay 1](link_da_imagem.png)
--->
+<img width="1204" height="540" alt="WhatsApp Image 2026-05-02 at 22 40 13" src="https://github.com/user-attachments/assets/0641b74c-0bc0-4aa2-a5f6-62e12478ac21" />
+<img width="1204" height="452" alt="WhatsApp Image 2026-05-02 at 22 40 42" src="https://github.com/user-attachments/assets/c8f96a03-0eaa-467c-81f1-b560aa73bf08" />
+
 
 ---
 
