@@ -60,6 +60,7 @@ class PeerRegistry {
     }
 
     fun getPeerIp(id: Byte): String? = peers[id]
+    fun getAllPeerIds(): List<Byte> = peers.keys().toList()
     fun getAllIps(): List<String> = peers.values.toList()
 
     fun clear() {

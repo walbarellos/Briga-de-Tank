@@ -6,7 +6,7 @@ import kotlin.test.*
 class GameLoopTest {
 
     @Test
-    fun `Turn order should follow Left-to-Right positions`() {
+    fun `Turn order should follow player ids`() {
         val terrain = Terrain(800, 480)
         val tanks = mutableListOf(
             Tank(0, Vector2(500f, 300f)), // Right
@@ -16,9 +16,9 @@ class GameLoopTest {
         val gameState = GameState("TEST", terrain, tanks)
         
         val sorted = gameState.getAlivePlayersSorted()
-        assertEquals(1, sorted[0].id, "First player must be the one at x=100")
-        assertEquals(2, sorted[1].id, "Second player must be the one at x=300")
-        assertEquals(0, sorted[2].id, "Third player must be the one at x=500")
+        assertEquals(0, sorted[0].id, "First player must be the lowest id")
+        assertEquals(1, sorted[1].id, "Second player must be the next id")
+        assertEquals(2, sorted[2].id, "Third player must be the highest id")
     }
 
     @Test
@@ -53,9 +53,7 @@ class GameLoopTest {
         var timeoutTriggered = false
         turnManager.onTimeout = { timeoutTriggered = true }
         
-        // Manual override for test speed
-        turnManager.remainingSeconds.set(1)
-        turnManager.startCountdown()
+        turnManager.startCountdown(1000)
         
         kotlinx.coroutines.delay(1200)
         assertTrue(timeoutTriggered, "Timeout callback must be triggered after delay")

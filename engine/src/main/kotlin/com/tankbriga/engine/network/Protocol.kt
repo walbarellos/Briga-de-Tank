@@ -5,8 +5,12 @@ import kotlinx.serialization.Serializable
 /** All packet types. */
 enum class PktType(val id: Byte) {
     ROOM_ANNOUNCE(0x01), JOIN_REQ(0x02), JOIN_ACK(0x03), PLAYER_JOINED(0x04),
+    LOBBY_SNAPSHOT(0x05), LOBBY_ACK(0x06),
     GAME_START(0x10), TURN_START(0x11),
     ACTION(0x12), ACTION_FWRD(0x13), TURN_TIMEOUT(0x14),
+    SHOT_RESOLVE(0x15),
+    AIM_STATE(0x16),
+    TURN_ACK(0x17), ACTION_ACK(0x18), RESOLVE_ACK(0x19),
     ELIM(0x20), GAME_OVER(0x21),
     HEARTBEAT(0x30), COORD_ELECTED(0x31),
     RESYNC_REQ(0x40), RESYNC_ACK(0x41),
@@ -24,6 +28,23 @@ data class RoomAnnounce(
     val playerCount: Int,
     val countdown: Int,     // segundos restantes; -1 = em jogo (aceita rejoin)
     val roomId: Int = 0
+)
+
+@Serializable
+data class PlayerSlot(
+    val id: Byte,
+    val name: String,
+    val color: Int,
+    val hp: Int,
+    val x: Float,
+    val y: Float
+)
+
+@Serializable
+data class LobbySnapshot(
+    val lobbyWord: String,
+    val hostId: Byte,
+    val players: List<PlayerSlot>
 )
 
 /** Payload de REJOIN_REQ — enviado via unicast ao coordinator. */
@@ -57,7 +78,43 @@ data class TurnStartPacket(
     val playerId: Byte,
     val windValue: Float,
     val turnNumber: Short,
-    val timerMs: Int = 15_000
+    val timerMs: Int = 15_000,
+    val serverStartMs: Long = 0L
+)
+
+@Serializable
+data class ShotResolvePacket(
+    val shotId: Short,
+    val turnNumber: Short,
+    val shooterId: Byte,
+    val resultType: Byte,
+    val impactX: Float,
+    val impactY: Float,
+    val shotType: Byte,
+    val shotAngle: Float,
+    val directTankId: Byte?,
+    val craterRadius: Int,
+    val tankIds: List<Byte>,
+    val tankHps: List<Int>,
+    val tankPositionsX: List<Float>,
+    val tankPositionsY: List<Float>,
+    val eliminated: List<Byte>
+)
+
+@Serializable
+data class AimStatePacket(
+    val playerId: Byte,
+    val angle: Float,
+    val power: Float,
+    val charging: Boolean,
+    val turnNumber: Short
+)
+
+@Serializable
+data class AckPacket(
+    val kind: Byte,
+    val turnNumber: Short,
+    val shotId: Short = 0
 )
 
 /** Eleição de coordinator. */

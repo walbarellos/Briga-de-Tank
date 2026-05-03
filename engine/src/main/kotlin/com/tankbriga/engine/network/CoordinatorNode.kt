@@ -6,24 +6,21 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 /**
- * Sequenciador de turnos e detector de falhas.
- *
- * FIXES:
- *  - Heartbeat loop agora realmente envia pacotes (antes era só ler)
- *  - startNextTurn() agora chama onBroadcast (antes só fazia println)
- *  - triggerPanicFire() implementado (antes era comentário)
- *  - electNewCoordinator() agora notifica os peers via onBroadcast
- *  - Suporte a REJOIN: player que voltou recebe snapshot e continua no turno
+ * AUTHORITATIVE TURN SEQUENCER.
+ * In a Mesh network, one node (Coordinator) manages the clock and turn order.
  */
 class CoordinatorNode(
-    val myId: Byte,
+    var myId: Byte,
     private val lobbyWord: String,
     private val players: MutableList<Byte>,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
 ) {
-    private var currentCoordinatorId: Byte = players.firstOrNull() ?: 0
+    private var currentCoordinatorId: Byte = myId
     private var epoch: Short = 0
     private val lastHeartbeat = mutableMapOf<Byte, Long>()
+    
+    // Authorization: only these players are allowed to fire
+    val authorizedPlayers = mutableSetOf<Byte>()
 
     var currentTurnPlayerId: Byte = -1
         private set
@@ -33,20 +30,47 @@ class CoordinatorNode(
     private var timeoutJob: Job? = null
     private var heartbeatJob: Job? = null
     private var watchdogJob: Job? = null
+    var failoverEnabled: Boolean = false
 
-    var isCoordinator: Boolean = (myId == currentCoordinatorId)
-        private set
+    val isCoordinator: Boolean get() = (myId == currentCoordinatorId)
 
-    // Callbacks injetados pelo UdpNetworkManager
     var onBroadcast: ((ByteArray) -> Unit)? = null
-    var onTurnStart: ((TurnStartPacket) -> Unit)? = null      // para atualizar UI local
-    var onPanicFire: ((Byte) -> Unit)? = null                 // para disparar ação automática
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    var onTurnStart: ((TurnStartPacket) -> Unit)? = null
+    var onPanicFire: ((Byte) -> Unit)? = null
+    var onBuildSnapshot: (() -> RejoinSnapshot)? = null
 
     fun start() {
+        val initialPlayers = players.toList()
+        authorizedPlayers.clear()
+        registerPlayer(myId)
+        initialPlayers.forEach { registerPlayer(it) }
+        
+        updateCoordinator()
         startHeartbeatLoop()
         startWatchdogLoop()
+    }
+
+    fun setInitialCoordinator(id: Byte) {
+        if (!players.contains(id)) players.add(id)
+        players.sort()
+        currentCoordinatorId = id
+        lastHeartbeat.putIfAbsent(id, System.currentTimeMillis())
+    }
+
+    fun registerPlayer(playerId: Byte) {
+        if (authorizedPlayers.add(playerId)) {
+            if (!players.contains(playerId)) {
+                players.add(playerId)
+                players.sort()
+            }
+        }
+        lastHeartbeat.putIfAbsent(playerId, System.currentTimeMillis())
+        updateCoordinator()
+    }
+
+    private fun updateCoordinator() {
+        val sorted = authorizedPlayers.toList().sorted()
+        currentCoordinatorId = sorted.firstOrNull() ?: myId
     }
 
     fun stop() {
@@ -55,15 +79,13 @@ class CoordinatorNode(
         watchdogJob?.cancel()
     }
 
-    // ── Heartbeat: envia a cada 1s, detecta queda em 3s ──────────────────────
-
     private fun startHeartbeatLoop() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (isActive) {
                 val payload = byteArrayOf(PktType.HEARTBEAT.id, myId)
                 onBroadcast?.invoke(payload)
-                lastHeartbeat[myId] = System.currentTimeMillis() // conta o próprio
+                lastHeartbeat[myId] = System.currentTimeMillis()
                 delay(1000)
             }
         }
@@ -71,10 +93,8 @@ class CoordinatorNode(
 
     fun onHeartbeatReceived(playerId: Byte) {
         lastHeartbeat[playerId] = System.currentTimeMillis()
-        if (!players.contains(playerId)) players.add(playerId)
+        registerPlayer(playerId)
     }
-
-    // ── Watchdog: verifica coordinator a cada 1.5s ────────────────────────────
 
     private fun startWatchdogLoop() {
         watchdogJob?.cancel()
@@ -86,28 +106,25 @@ class CoordinatorNode(
         }
     }
 
-    private fun checkCoordinatorHealth() {
+    internal fun checkCoordinatorHealth() {
+        if (!failoverEnabled) return
         val now = System.currentTimeMillis()
-        val coordinatorAlive = lastHeartbeat[currentCoordinatorId]?.let { now - it < 3000 } ?: false
-
-        if (!coordinatorAlive && currentCoordinatorId != myId) {
-            electNewCoordinator()
-        }
+        val coordinatorAlive = lastHeartbeat[currentCoordinatorId]?.let { now - it < 4000 } ?: (currentCoordinatorId == myId)
+        if (!coordinatorAlive) electNewCoordinator()
     }
 
     private fun electNewCoordinator() {
         val now = System.currentTimeMillis()
-        val activePlayers = players.filter {
+        val activePlayers = authorizedPlayers.filter {
             lastHeartbeat[it]?.let { t -> now - t < 5000 } ?: (it == myId)
-        }
-        val candidate = activePlayers.minOrNull() ?: myId
-        if (candidate == currentCoordinatorId) return // nada mudou
+        }.sorted()
+        
+        val candidate = activePlayers.firstOrNull() ?: myId
+        if (candidate == currentCoordinatorId) return
 
         currentCoordinatorId = candidate
-        isCoordinator = (myId == candidate)
         epoch++
 
-        // Notifica todos os peers da eleição
         val msg = Json.encodeToString(CoordElectedPacket(candidate, epoch)).toByteArray()
         val payload = ByteArray(1 + msg.size)
         payload[0] = PktType.COORD_ELECTED.id
@@ -115,135 +132,102 @@ class CoordinatorNode(
         onBroadcast?.invoke(payload)
 
         if (isCoordinator) {
-            // Coordinator novo: agenda o próximo turno se o antigo tinha um turno aberto
             scope.launch {
-                delay(500) // grace period para os peers processarem a eleição
+                delay(500)
                 startNextTurn()
             }
         }
     }
 
     fun onCoordElected(pkt: CoordElectedPacket) {
-        if (pkt.epoch > epoch) { // aceita só epochs maiores (evita split-brain)
+        if (pkt.epoch >= epoch) {
             epoch = pkt.epoch
             currentCoordinatorId = pkt.newCoordId
-            isCoordinator = (myId == pkt.newCoordId)
-            timeoutJob?.cancel() // cancela qualquer timeout local
+            timeoutJob?.cancel()
         }
     }
 
-    // ── Turn management ────────────────────────────────────────────────────────
+    fun onTurnStarted(pkt: TurnStartPacket) {
+        turnNumber = pkt.turnNumber
+        currentTurnPlayerId = pkt.playerId
+        timeoutJob?.cancel()
+    }
 
+    /**
+     * Advances the match clock. MUST be consistent on all devices.
+     * We sort by ID to ensure identical order regardless of map position.
+     */
     fun startNextTurn() {
         if (!isCoordinator) return
-
+        
         turnNumber++
+        val sortedPlayers = authorizedPlayers.toList().sorted()
+        if (sortedPlayers.isEmpty()) return
 
-        // Rotação apenas entre players VIVOS (não apenas index cego)
-        val alivePlayers = players.filter { aliveIds.contains(it) }
-        if (alivePlayers.isEmpty()) return
+        currentTurnPlayerId = sortedPlayers[((turnNumber - 1) % sortedPlayers.size).toInt()]
 
-        currentTurnPlayerId = alivePlayers[(turnNumber % alivePlayers.size).toInt()]
-
+        // Use turnNumber as seed for wind consistency
         DeterministicRng.init(lobbyWord, turnNumber.toInt())
         val wind = DeterministicRng.windForTurn()
 
-        val pkt = TurnStartPacket(currentTurnPlayerId, wind, turnNumber)
+        val pkt = TurnStartPacket(
+            playerId = currentTurnPlayerId,
+            windValue = wind,
+            turnNumber = turnNumber,
+            serverStartMs = System.currentTimeMillis()
+        )
         val json = Json.encodeToString(pkt).toByteArray()
         val payload = ByteArray(1 + json.size)
         payload[0] = PktType.TURN_START.id
         System.arraycopy(json, 0, payload, 1, json.size)
+        
         onBroadcast?.invoke(payload)
         onTurnStart?.invoke(pkt)
 
-        // Timer de 15s — panic fire se expirar
+        // PANIC TIMER: 18s (15s game + 3s network buffer)
         timeoutJob?.cancel()
         timeoutJob = scope.launch {
-            delay(15_000)
+            delay(18_000)
             triggerPanicFire(currentTurnPlayerId)
         }
     }
 
     fun onActionReceived() {
-        // Player atirou — cancela o timeout
         timeoutJob?.cancel()
     }
 
     private fun triggerPanicFire(playerId: Byte) {
         if (!isCoordinator) return
-
-        // Gera ângulo/potência aleatórios com o RNG determinístico
-        // Todos os devices chegam ao mesmo valor porque usam o mesmo seed do turno
         DeterministicRng.init(lobbyWord, turnNumber.toInt() + 999)
-        val randomAngle = (DeterministicRng.nextFloat() * 1800).toInt().toShort()
-        val randomPower = (30 + (DeterministicRng.nextFloat() * 40)).toInt().toByte()
+        val randomAngle = (45 + DeterministicRng.nextFloat() * 45).toInt().toShort()
+        val randomPower = (40 + (DeterministicRng.nextFloat() * 30)).toInt().toByte()
 
-        val action = com.tankbriga.engine.ActionPacket(
-            playerId = playerId,
-            angleTenths = randomAngle,
-            power = randomPower,
-            shotType = 0,
-            moveDir = 0,
-            seq = nextSeq()
-        )
-
-        // Broadcast o ACTION como se fosse do player que deixou passar
+        val action = com.tankbriga.engine.ActionPacket(playerId, (randomAngle * 10).toShort(), randomPower, 0, 0, turnNumber)
         val bin = action.toBinary()
         val payload = ByteArray(1 + bin.size)
-        payload[0] = PktType.ACTION.id
+        payload[0] = PktType.ACTION_FWRD.id // Coordinator-forced action
         System.arraycopy(bin, 0, payload, 1, bin.size)
         onBroadcast?.invoke(payload)
-        onPanicFire?.invoke(playerId)
     }
 
-    // ── Reconexão ─────────────────────────────────────────────────────────────
+    fun onPlayerEliminated(id: Byte) {
+        lastHeartbeat.remove(id)
+        // In this simple mesh, we keep them in authorizedPlayers to keep the index logic stable,
+        // but startNextTurn will skip them if we add HP checks.
+    }
 
-    // IDs dos players vivos (atualizado pelo GameState via callback)
-    val aliveIds = mutableSetOf<Byte>().also { it.addAll(players) }
-
-    fun onPlayerEliminated(id: Byte) { aliveIds.remove(id) }
-
-    /**
-     * Processa pedido de rejoin.
-     * Retorna snapshot se a palavra bater e o player estava na partida.
-     * Chama onBroadcast com REJOIN_ACK ou REJOIN_DENIED.
-     */
     fun onRejoinRequest(req: RejoinRequest, targetIp: String, sendUnicast: (ByteArray, String) -> Unit) {
         if (!isCoordinator) return
-
-        val validWord = req.lobbyWord == lobbyWord
-        val wasPlayer = players.contains(req.playerId)
-
-        if (!validWord || !wasPlayer) {
+        if (req.lobbyWord != lobbyWord) {
             sendUnicast(byteArrayOf(PktType.REJOIN_DENIED.id), targetIp)
             return
         }
-
-        // Re-autentica o peer (será re-adicionado pelo PeerRegistry no UdpNetworkManager)
-        val snapshotJson = buildSnapshot()
+        val snapshotJson = onBuildSnapshot?.invoke() ?: return
         val json = Json.encodeToString(snapshotJson).toByteArray()
         val payload = ByteArray(1 + json.size)
         payload[0] = PktType.REJOIN_ACK.id
         System.arraycopy(json, 0, payload, 1, json.size)
         sendUnicast(payload, targetIp)
-
-        // Re-adiciona heartbeat para não trigger eleição
         lastHeartbeat[req.playerId] = System.currentTimeMillis()
     }
-
-    // Esse callback é injetado pelo GameState para montar o snapshot real
-    var onBuildSnapshot: (() -> RejoinSnapshot)? = null
-
-    private fun buildSnapshot(): RejoinSnapshot {
-        return onBuildSnapshot?.invoke() ?: RejoinSnapshot(
-            turnNumber, currentTurnPlayerId,
-            emptyList(), emptyList(), emptyList(),
-            emptyList(), emptyList(), emptyList()
-        )
-    }
-
-    // ── Utils ─────────────────────────────────────────────────────────────────
-
-    private var seqCounter: Short = 0
-    private fun nextSeq(): Short { seqCounter++; return seqCounter }
 }

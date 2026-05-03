@@ -13,6 +13,10 @@ import com.tankbriga.app.audio.AudioSynthesizer
 import com.tankbriga.app.network.UdpNetworkManager
 import com.tankbriga.app.render.*
 import com.tankbriga.engine.*
+import com.tankbriga.engine.network.AimStatePacket
+import com.tankbriga.engine.network.LobbySnapshot
+import com.tankbriga.engine.network.PlayerSlot
+import com.tankbriga.engine.network.ShotResolvePacket
 import kotlinx.coroutines.*
 import kotlin.math.abs
 import kotlin.math.max
@@ -38,6 +42,7 @@ class GameView @JvmOverloads constructor(
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var turnSeconds = TurnManager.TURN_SECONDS
+    private var localPlayerId: Byte = 0
 
     private var ghostPath: List<Vector2>? = null
     private var lastGhostAtMs = 0L
@@ -50,6 +55,16 @@ class GameView @JvmOverloads constructor(
     private var activeShotIndex = 0
     private var flightResolvePosted = false
     private var lastShooterId: Byte = -1
+    private var pendingShotResolve: ShotResolvePacket? = null
+    private val remoteAimAngles = mutableMapOf<Byte, Float>()
+    private val remoteAimPowers = mutableMapOf<Byte, Float>()
+    private var lastAimBroadcastMs = 0L
+    private var lastBroadcastAngle = -999f
+    private var lastBroadcastPower = -999f
+    private var localShotSeq: Short = 0
+    private var activeShotId: Short = 0
+    private var debugOverlay: String? = null
+    private var debugOverlayEnabled = true
 
     private var hudMessage: String? = null
     private var hudMessageUntilMs = 0L
@@ -108,30 +123,26 @@ class GameView @JvmOverloads constructor(
         this.networkManager = mgr
     }
 
+    fun setLocalPlayerId(id: Byte) {
+        this.localPlayerId = id
+    }
+
     fun handlePeerJoined(name: String, ip: String, id: Byte) {
         val state = gameState ?: return
         if (state.phase != MatchPhase.LOBBY) return
-        if (remotePlayers.containsKey(ip)) return
-        
+        if (id == localPlayerId) return
         remotePlayers[ip] = name
-        val x = (id + 1) * (state.terrain.width * 0.12f)
         post {
-            state.players.add(Tank(
-                id = id,
-                position = state.terrain.placeOnSurface(x, 14f),
-                name = name,
-                isBot = false,
-                color = tankColorForId(id)
-            ))
             AudioSynthesizer.playTurnStart()
+            showMessage("$name entrou na sala!", 1500)
         }
     }
 
     fun handleRemoteStart() {
         val state = gameState ?: return
-        if (state.phase == MatchPhase.LOBBY) {
+        if (state.phase == MatchPhase.PLAYER_TURN) {
             post { 
-                turnManager?.nextTurn() 
+                // Multiplayer Start: Banner only, TurnStart packet will drive actual logic
                 syncWindIntoSimulation()
                 showTurnBanner()
             }
@@ -142,6 +153,31 @@ class GameView @JvmOverloads constructor(
         post { fireAction(action) }
     }
 
+    fun handleShotResolved(packet: ShotResolvePacket) {
+        post {
+            val state = gameState ?: return@post
+            if (state.phase == MatchPhase.FLIGHT && lastShooterId == packet.shooterId && activeShotId == packet.shotId) {
+                pendingShotResolve = packet
+            } else {
+                applyAuthoritativeResolve(packet, showEffects = true)
+            }
+        }
+    }
+
+    fun handleNetworkDebug(text: String) {
+        debugOverlay = text
+    }
+
+    fun handleAimState(packet: AimStatePacket) {
+        if (packet.playerId == localPlayerId) return
+        val oldAngle = remoteAimAngles[packet.playerId]
+        remoteAimAngles[packet.playerId] = packet.angle
+        remoteAimPowers[packet.playerId] = packet.power
+        if (oldAngle == null || abs(oldAngle - packet.angle) >= 1f) {
+            AudioSynthesizer.playTick()
+        }
+    }
+
     fun handleTurnStart(pkt: com.tankbriga.engine.network.TurnStartPacket) {
         val state = gameState ?: return
         post {
@@ -149,6 +185,17 @@ class GameView @JvmOverloads constructor(
             state.windState.setWind(pkt.windValue)
             state.turnNumber = pkt.turnNumber.toInt()
             state.phase = MatchPhase.PLAYER_TURN
+            remoteAimAngles.clear()
+            remoteAimPowers.clear()
+            
+            val elapsed = if (pkt.serverStartMs > 0L) {
+                (System.currentTimeMillis() - pkt.serverStartMs).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            val remainingMs = (pkt.timerMs - elapsed).toInt().coerceAtLeast(1000)
+            turnManager?.startCountdown(remainingMs)
+            
             syncWindIntoSimulation()
             focusCurrentTankSoftly()
             showTurnBanner()
@@ -202,19 +249,25 @@ class GameView @JvmOverloads constructor(
         
         val x = event.x
         val y = event.y
-        val humanTurn = state.currentPlayer()?.isBot == false && state.phase == MatchPhase.PLAYER_TURN
-        val isHost = state.players.firstOrNull()?.id == state.humanPlayer()?.id
+        val humanTurn = state.currentTurnPlayerId == localPlayerId && state.phase == MatchPhase.PLAYER_TURN
+        val isHost = localPlayerId == 0.toByte()
 
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                activeControl = hudRenderer.hitTest(x, y, width, height)
-                
-                if (state.phase == MatchPhase.LOBBY && isHost && x > width/2 - 100 && x < width/2 + 100 && y > height * 0.8f) {
-                    networkManager?.sendStartSignal()
-                    handleRemoteStart()
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2 && y < height * 0.35f) {
+                    debugOverlayEnabled = !debugOverlayEnabled
+                    showMessage(if (debugOverlayEnabled) "Debug multiplayer ligado" else "Debug multiplayer oculto", 900)
                     return true
                 }
-
+            }
+            MotionEvent.ACTION_DOWN -> {
+                if (event.pointerCount >= 2 && y < height * 0.35f) {
+                    debugOverlayEnabled = !debugOverlayEnabled
+                    showMessage(if (debugOverlayEnabled) "Debug multiplayer ligado" else "Debug multiplayer oculto", 900)
+                    return true
+                }
+                activeControl = hudRenderer.hitTest(x, y, width, height)
+                
                 when (activeControl) {
                     HudControl.CAMERA -> {
                         toggleCameraMode()
@@ -223,6 +276,7 @@ class GameView @JvmOverloads constructor(
                     HudControl.FIRE -> if (humanTurn) startCharging()
                     HudControl.POWER_BAR -> if (humanTurn) {
                         currentPower = hudRenderer.powerFromTouch(x, width, height)
+                        broadcastAimState(force = true)
                         showMessage("Força ${currentPower.toInt()} — mire e toque FOGO", 1100)
                     }
                     HudControl.AIM -> if (humanTurn) {
@@ -237,6 +291,13 @@ class GameView @JvmOverloads constructor(
                         startAngleRepeat(-1f)
                         AudioSynthesizer.playTick()
                     }
+                    HudControl.START_GAME -> if (state.phase == MatchPhase.LOBBY && isHost) {
+                        networkManager?.sendLobbySnapshot(buildLobbySnapshot(state))
+                        viewScope.launch {
+                            delay(900)
+                            networkManager?.sendStartSignal()
+                        }
+                    }
                     HudControl.NONE -> {
                         isScrollingCamera = true
                     }
@@ -249,9 +310,13 @@ class GameView @JvmOverloads constructor(
             MotionEvent.ACTION_MOVE -> {
                 when (activeControl) {
                     HudControl.AIM -> if (humanTurn) setAngleFromTouch(y)
-                    HudControl.POWER_BAR -> if (humanTurn) currentPower = hudRenderer.powerFromTouch(x, width, height)
+                    HudControl.POWER_BAR -> if (humanTurn) {
+                        currentPower = hudRenderer.powerFromTouch(x, width, height)
+                        broadcastAimState()
+                    }
                     HudControl.FIRE -> Unit
                     HudControl.ANGLE_UP, HudControl.ANGLE_DOWN -> Unit
+                    HudControl.START_GAME -> Unit
                     HudControl.NONE -> if (isScrollingCamera && camera?.mode == CameraMode.FREE) {
                         camera?.panByScreenDelta(lastTouchX - x, lastTouchY - y)
                     }
@@ -288,11 +353,13 @@ class GameView @JvmOverloads constructor(
             currentAngle = (currentAngle + delta).coerceIn(5f, 175f)
             vibrate(10)
             updateGhostPath(force = true)
+            broadcastAimState(force = true)
             delay(350)
             while (isActive) {
                 currentAngle = (currentAngle + delta).coerceIn(5f, 175f)
                 vibrate(6)
                 updateGhostPath(force = true)
+                broadcastAimState()
                 delay(60)
             }
         }
@@ -309,6 +376,7 @@ class GameView @JvmOverloads constructor(
         chargeStartMs = System.currentTimeMillis()
         showMessage("Carregando força... solte em FOGO", 900)
         vibrate(18)
+        broadcastAimState(force = true)
     }
 
     private var lastChargeSoundMs = 0L
@@ -323,6 +391,7 @@ class GameView @JvmOverloads constructor(
             AudioSynthesizer.playCharge(currentPower)
             lastChargeSoundMs = now
         }
+        broadcastAimState()
     }
 
     private fun setAngleFromTouch(y: Float) {
@@ -331,15 +400,41 @@ class GameView @JvmOverloads constructor(
         if (abs(currentAngle - old) >= 1.0f) {
             AudioSynthesizer.playTick()
             checkSnaps(old, currentAngle)
+            broadcastAimState()
         }
+    }
+
+    private fun broadcastAimState(force: Boolean = false) {
+        val state = gameState ?: return
+        val mgr = networkManager ?: return
+        if (state.phase != MatchPhase.PLAYER_TURN || state.currentTurnPlayerId != localPlayerId) return
+
+        val now = System.currentTimeMillis()
+        if (!force &&
+            now - lastAimBroadcastMs < 80L &&
+            abs(currentAngle - lastBroadcastAngle) < 0.8f &&
+            abs(currentPower - lastBroadcastPower) < 2f
+        ) return
+
+        lastAimBroadcastMs = now
+        lastBroadcastAngle = currentAngle
+        lastBroadcastPower = currentPower
+        mgr.sendAimState(
+            AimStatePacket(
+                playerId = localPlayerId,
+                angle = currentAngle,
+                power = currentPower,
+                charging = isCharging,
+                turnNumber = state.turnNumber.toShort()
+            )
+        )
     }
 
     private fun updateGhostPath(force: Boolean = false) {
         val state = gameState ?: return
         val orchestrator = simulationOrchestrator ?: return
         if (state.phase != MatchPhase.PLAYER_TURN) return
-        val currentTank = state.currentPlayer() ?: return
-        if (currentTank.isBot) return
+        if (state.currentTurnPlayerId != localPlayerId) return
 
         val now = System.currentTimeMillis()
         val previewPower = 100f
@@ -350,7 +445,7 @@ class GameView @JvmOverloads constructor(
         lastGhostAngle = currentAngle
         lastGhostPower = previewPower
         val mockAction = ActionPacket(
-            state.currentTurnPlayerId,
+            localPlayerId,
             (currentAngle * 10).toInt().toShort(),
             previewPower.toInt().toByte(),
             0,
@@ -372,7 +467,7 @@ class GameView @JvmOverloads constructor(
         }
         when (cam.mode) {
             CameraMode.GENERAL -> cam.fitPoints(state.players.filter { it.hp > 0 }.map { it.position }, padding = 270f)
-            CameraMode.FOCUS -> state.currentPlayer()?.let { cam.focusOn(it.position, 1.15f) }
+            CameraMode.FOCUS -> state.players.find { it.id == state.currentTurnPlayerId }?.let { cam.focusOn(it.position, 1.15f) }
             CameraMode.FREE -> showMessage("Câmera livre: arraste e faça zoom", 1200)
             CameraMode.PROJECTILE -> Unit
         }
@@ -385,23 +480,47 @@ class GameView @JvmOverloads constructor(
     }
 
     private fun fireHumanShot() {
-        val state = gameState ?: return
-        val action = ActionPacket(state.currentTurnPlayerId, (currentAngle * 10).toInt().toShort(), currentPower.toInt().toByte(), 0, 0, 0)
+        if (gameState == null) return
+        localShotSeq = (localShotSeq + 1).toShort()
+        val action = ActionPacket(localPlayerId, (currentAngle * 10).toInt().toShort(), currentPower.toInt().toByte(), 0, 0, localShotSeq)
+        broadcastAimState(force = true)
         networkManager?.sendAction(action)
-        fireAction(action)
+        showMessage("Aguardando autorização do host...", 900)
+    }
+
+    private fun buildLobbySnapshot(state: GameState): LobbySnapshot {
+        return LobbySnapshot(
+            lobbyWord = state.lobbyWord,
+            hostId = 0,
+            players = synchronized(state.players) { state.players.toList() }.sortedBy { it.id.toInt() }.map { tank ->
+                PlayerSlot(
+                    id = tank.id,
+                    name = tank.name,
+                    color = tank.color,
+                    hp = tank.hp,
+                    x = tank.position.x,
+                    y = tank.position.y
+                )
+            }
+        )
     }
 
     private fun passTurnOnTimeout() {
         val state = gameState ?: return
-        if (state.phase == MatchPhase.PLAYER_TURN && state.currentPlayer()?.isBot == false) {
+        if (state.phase == MatchPhase.PLAYER_TURN && state.currentTurnPlayerId == localPlayerId) {
             showMessage("Tempo esgotado — passou a vez", 1500)
             turnManager?.stopCountdown()
-            turnManager?.nextTurn()
-            syncWindIntoSimulation()
-            currentPower = 70f
-            ghostPath = null
-            focusCurrentTankSoftly()
-            showTurnBanner()
+            // Notify network manager for authoritative turn advance
+            if (networkManager != null) {
+                networkManager?.notifyImpactResolved()
+            } else {
+                turnManager?.nextTurn()
+                syncWindIntoSimulation()
+                currentPower = 70f
+                ghostPath = null
+                focusCurrentTankSoftly()
+                showTurnBanner()
+            }
         }
     }
 
@@ -426,7 +545,10 @@ class GameView @JvmOverloads constructor(
     private fun fireAction(action: ActionPacket) {
         val state = gameState ?: return
         val orchestrator = simulationOrchestrator ?: return
-        if (state.phase != MatchPhase.PLAYER_TURN) return
+        
+        // Relax checks: if the packet came, show it.
+        if (state.phase == MatchPhase.RESULTS) return
+        if (state.phase == MatchPhase.FLIGHT && lastShooterId == action.playerId) return
 
         syncWindIntoSimulation()
         turnManager?.stopCountdown()
@@ -438,6 +560,8 @@ class GameView @JvmOverloads constructor(
         activeShotIndex = 0
         flightResolvePosted = false
         lastShooterId = action.playerId
+        activeShotId = action.seq
+        pendingShotResolve = null
         val shooterName = state.players.find { it.id == action.playerId }?.name ?: "Jogador"
         showMessage("$shooterName atirou!", 1000)
         vibrate(45)
@@ -476,11 +600,26 @@ class GameView @JvmOverloads constructor(
 
     private fun resolveImpact(result: ShotResult) {
         val state = gameState ?: return
+        val mgr = networkManager
         activeShotPath = null
         activeShotResult = null
         activeShotIndex = 0
         flightResolvePosted = false
         state.phase = MatchPhase.IMPACT_RESOLVE
+
+        if (mgr != null && !mgr.isCoordinator()) {
+            val impact = impactPointFor(result, state)
+            camera?.focusOn(impact, 1.35f)
+            AudioSynthesizer.playMiss()
+            vibrate(60)
+            showMessage("Aguardando resultado do host...", 1200)
+
+            pendingShotResolve?.takeIf { it.shooterId == lastShooterId && it.shotId == activeShotId }?.let {
+                pendingShotResolve = null
+                applyAuthoritativeResolve(it, showEffects = true)
+            }
+            return
+        }
 
         when (result) {
             is ShotResult.TerrainHit -> resolveExplosion(result.impactPoint, result.shotType, result.angle, null, result)
@@ -490,16 +629,27 @@ class GameView @JvmOverloads constructor(
                 AudioSynthesizer.playMiss()
                 vibrate(100)
                 camera?.fitPoints(state.players.filter { it.hp > 0 }.map { it.position }, padding = 270f)
+                maybeBroadcastShotResolve(result, null)
             }
+        }
+
+        pendingShotResolve?.takeIf { it.shooterId == lastShooterId && it.shotId == activeShotId }?.let {
+            pendingShotResolve = null
+            applyAuthoritativeResolve(it, showEffects = true)
         }
 
         if (state.phase != MatchPhase.RESULTS) {
             postDelayed({
-                turnManager?.nextTurn()
-                syncWindIntoSimulation()
-                currentPower = 70f
-                focusCurrentTankSoftly()
-                showTurnBanner()
+                // MULTIPLAYER FIX: Notify network coordinator that local animation is done.
+                if (networkManager != null) {
+                    networkManager?.notifyImpactResolved()
+                } else {
+                    turnManager?.nextTurn()
+                    syncWindIntoSimulation()
+                    currentPower = 70f
+                    focusCurrentTankSoftly()
+                    showTurnBanner()
+                }
             }, 900L)
         } else {
             val winner = state.winnerId?.let { id -> state.players.find { it.id == id }?.name } ?: "ninguém"
@@ -507,8 +657,18 @@ class GameView @JvmOverloads constructor(
         }
     }
 
-    private fun resolveExplosion(impactPoint: Vector2, shotType: Byte, shotAngle: Float, directTankId: Byte?, rawResult: ShotResult) {
-        val state = gameState ?: return
+    private fun impactPointFor(result: ShotResult, state: GameState): Vector2 {
+        return when (result) {
+            is ShotResult.TerrainHit -> result.impactPoint
+            is ShotResult.TankHit -> result.impactPoint
+            is ShotResult.Miss -> result.path.lastOrNull()
+                ?: state.players.find { it.id == lastShooterId }?.position
+                ?: Vector2(0f, 0f)
+        }
+    }
+
+    private fun resolveExplosion(impactPoint: Vector2, shotType: Byte, shotAngle: Float, directTankId: Byte?, rawResult: ShotResult): ImpactReport? {
+        val state = gameState ?: return null
         val report = state.applyExplosion(impactPoint, shotType, shotAngle, directTankId)
         terrainRenderer?.syncFromTerrain(impactPoint.x.toInt(), impactPoint.y.toInt(), report.craterRadius)
         particles.emitExplosion(impactPoint.x, impactPoint.y, report.craterRadius)
@@ -517,24 +677,97 @@ class GameView @JvmOverloads constructor(
 
         if (report.hitSomeone) {
             AudioSynthesizer.playTankHit()
-            val hitPlayer = report.damages.any { it.tankId == state.humanPlayer()?.id }
-            if (hitPlayer) {
-                vibrate(300)
-            } else {
-                vibrate(60)
-            }
+            val hitPlayer = report.damages.any { it.tankId == localPlayerId }
+            if (hitPlayer) vibrate(300) else vibrate(60)
         } else {
             AudioSynthesizer.playMiss()
             vibrate(100)
         }
 
-        if (report.eliminated.isNotEmpty()) {
-            AudioSynthesizer.playDeath()
-        }
+        if (report.eliminated.isNotEmpty()) AudioSynthesizer.playDeath()
 
         camera?.focusOn(impactPoint, 1.45f)
         camera?.triggerShake(if (report.hitSomeone) 30f else 20f, 20)
         showMessage(feedbackFor(rawResult, report), 2300)
+        maybeBroadcastShotResolve(rawResult, report)
+        return report
+    }
+
+    private fun maybeBroadcastShotResolve(result: ShotResult, report: ImpactReport?) {
+        val state = gameState ?: return
+        val mgr = networkManager ?: return
+        if (!mgr.isCoordinator()) return
+
+        val impact = when (result) {
+            is ShotResult.TerrainHit -> result.impactPoint
+            is ShotResult.TankHit -> result.impactPoint
+            is ShotResult.Miss -> result.path.lastOrNull() ?: state.players.find { it.id == lastShooterId }?.position ?: Vector2(0f, 0f)
+        }
+        val shotType = when (result) {
+            is ShotResult.TerrainHit -> result.shotType
+            is ShotResult.TankHit -> result.shotType
+            is ShotResult.Miss -> 0
+        }
+        val directTankId = when (result) {
+            is ShotResult.TankHit -> result.hitTankId
+            else -> null
+        }
+        val resultType = when (result) {
+            is ShotResult.Miss -> 0
+            is ShotResult.TerrainHit -> 1
+            is ShotResult.TankHit -> 2
+        }.toByte()
+
+        mgr.sendShotResolve(
+            ShotResolvePacket(
+                turnNumber = state.turnNumber.toShort(),
+                shotId = activeShotId,
+                shooterId = lastShooterId,
+                resultType = resultType,
+                impactX = impact.x,
+                impactY = impact.y,
+                shotType = shotType,
+                shotAngle = result.angle,
+                directTankId = directTankId,
+                craterRadius = report?.craterRadius ?: 0,
+                tankIds = state.players.map { it.id },
+                tankHps = state.players.map { it.hp },
+                tankPositionsX = state.players.map { it.position.x },
+                tankPositionsY = state.players.map { it.position.y },
+                eliminated = report?.eliminated ?: emptyList()
+            )
+        )
+    }
+
+    private fun applyAuthoritativeResolve(packet: ShotResolvePacket, showEffects: Boolean) {
+        val state = gameState ?: return
+        val impact = Vector2(packet.impactX, packet.impactY)
+        if (state.phase != MatchPhase.RESULTS) state.phase = MatchPhase.IMPACT_RESOLVE
+
+        if (packet.resultType != 0.toByte() && packet.craterRadius > 0 && showEffects) {
+            state.terrain.circleErode(packet.impactX.toInt(), packet.impactY.toInt(), packet.craterRadius)
+            terrainRenderer?.syncFromTerrain(packet.impactX.toInt(), packet.impactY.toInt(), packet.craterRadius)
+            particles.emitExplosion(packet.impactX, packet.impactY, packet.craterRadius)
+            lastImpactPoint = impact
+            lastImpactUntilMs = System.currentTimeMillis() + 1700L
+            camera?.focusOn(impact, 1.45f)
+            camera?.triggerShake(24f, 18)
+            AudioSynthesizer.playTankHit()
+        }
+
+        packet.tankIds.forEachIndexed { index, id ->
+            val tank = state.players.find { it.id == id } ?: return@forEachIndexed
+            tank.hp = packet.tankHps.getOrElse(index) { tank.hp }
+            val x = packet.tankPositionsX.getOrElse(index) { tank.position.x }
+            val y = packet.tankPositionsY.getOrElse(index) { tank.position.y }
+            tank.position = Vector2(x, y)
+        }
+
+        if (packet.tankIds.contains(localPlayerId)) {
+            val localIndex = packet.tankIds.indexOf(localPlayerId)
+            val localHp = packet.tankHps.getOrNull(localIndex)
+            if (localHp != null && localHp <= 0) vibrate(300)
+        }
     }
 
     private fun feedbackFor(result: ShotResult, report: ImpactReport): String {
@@ -566,15 +799,15 @@ class GameView @JvmOverloads constructor(
 
     private fun focusCurrentTankSoftly() {
         val state = gameState ?: return
-        val tank = state.currentPlayer() ?: return
+        val tank = state.players.find { it.id == state.currentTurnPlayerId } ?: return
         camera?.mode = CameraMode.FOCUS
         camera?.focusOn(tank.position, if (tank.isBot) 1.0f else 1.18f)
     }
 
     private fun showTurnBanner() {
         val state = gameState ?: return
-        val current = state.currentPlayer() ?: return
-        val text = if (current.isBot) "VEZ DE ${current.name}" else "SUA VEZ — mire com calma"
+        val current = state.players.find { it.id == state.currentTurnPlayerId } ?: return
+        val text = if (current.id == localPlayerId) "SUA VEZ — mire com calma" else "VEZ DE ${current.name}"
         showMessage(text, 1600)
         AudioSynthesizer.playTurnStart()
     }
@@ -616,6 +849,7 @@ class GameView @JvmOverloads constructor(
         val state = gameState ?: return
         val cam = camera ?: return
         if (terrainRenderer == null) terrainRenderer = TerrainRenderer(state.terrain).apply { initialize() }
+        val playersSnapshot = synchronized(state.players) { state.players.toList() }
 
         updateChargePower()
         maybeAutoPlayBotTurn()
@@ -631,9 +865,10 @@ class GameView @JvmOverloads constructor(
         drawActiveProjectile(canvas)
         drawImpactMarker(canvas)
 
-        state.players.forEach { tank ->
+        playersSnapshot.forEach { tank ->
             if (tank.hp > 0) {
-                tankRenderer.draw(canvas, tank, tank.color, tank.id == state.currentTurnPlayerId, currentAngle, !tank.isBot)
+                val aimAngle = if (tank.id == localPlayerId) currentAngle else remoteAimAngles[tank.id] ?: currentAngle
+                tankRenderer.draw(canvas, tank, tank.color, tank.id == state.currentTurnPlayerId, aimAngle, tank.id == localPlayerId)
             }
         }
         particles.draw(canvas)
@@ -648,19 +883,43 @@ class GameView @JvmOverloads constructor(
             currentAngle,
             state.phase.name,
             cam.mode.name,
-            state.players,
+            playersSnapshot,
             state.terrain.width,
             state.terrain.height,
             cam,
-            state.currentPlayer(),
+            playersSnapshot.find { it.id == state.currentTurnPlayerId },
             turnSeconds,
             visibleMessage(),
-            isCharging
+            isCharging,
+            isHost = (localPlayerId == 0.toByte())
         )
+        drawDebugOverlay(canvas)
+    }
+
+    private fun drawDebugOverlay(canvas: Canvas) {
+        if (!debugOverlayEnabled) return
+        val text = debugOverlay ?: return
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(190, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(180, 255, 180)
+            textSize = 18f
+            typeface = Typeface.MONOSPACE
+        }
+        val lines = text.lines()
+        val width = (lines.maxOfOrNull { textPaint.measureText(it) } ?: 0f) + 24f
+        val height = lines.size * 22f + 18f
+        val rect = RectF(12f, 170f, 12f + width, 170f + height)
+        canvas.drawRoundRect(rect, 8f, 8f, paint)
+        lines.forEachIndexed { i, line ->
+            canvas.drawText(line, rect.left + 12f, rect.top + 24f + i * 22f, textPaint)
+        }
     }
 
     private fun drawGhostTrajectory(canvas: Canvas, state: GameState) {
-        if (state.phase != MatchPhase.PLAYER_TURN) return
+        if (state.phase != MatchPhase.PLAYER_TURN || state.currentTurnPlayerId != localPlayerId) return
         val path = ghostPath ?: return
         if (path.isEmpty()) return
         val dp = Path()

@@ -13,25 +13,44 @@ enum class MatchPhase {
     RESULTS
 }
 
-/** Global match state container. */
+/**
+ * Orchestrates the full state of a TankBriga match.
+ */
 class GameState(
     val lobbyWord: String,
     val terrain: Terrain,
     val players: MutableList<Tank> = mutableListOf()
 ) {
-    var phase: MatchPhase = MatchPhase.LOBBY
+    var phase: MatchPhase = MatchPhase.ROUND_START
     var turnNumber: Int = 0
-    var currentTurnPlayerId: Byte = -1
-    var wind: Float = 0f
-    var windState: WindState = WindState.zero()
-
-    val eliminationOrder = mutableListOf<Byte>()
+    var currentTurnPlayerId: Byte = 0
+    val windState = WindState(0f, 0f)
     var winnerId: Byte? = null
+    private val eliminationOrder = mutableListOf<Byte>()
 
-    fun getAlivePlayersSorted(): List<Tank> = players.filter { it.hp > 0 }.sortedBy { it.position.x }
+    fun getAlivePlayersSorted(): List<Tank> = players.filter { it.hp > 0 }.sortedBy { it.id.toInt() }
 
     fun currentPlayer(): Tank? = players.find { it.id == currentTurnPlayerId }
     fun humanPlayer(): Tank? = players.firstOrNull { !it.isBot }
+
+    /**
+     * Adds a player with deterministic spawn positioning.
+     * Host = ID 0, Peers = IDs 1-7.
+     */
+    fun addPlayer(id: Byte, name: String, isBot: Boolean, color: Int): Tank {
+        synchronized(players) {
+            val existing = players.find { it.id == id }
+            if (existing != null) return existing
+
+            val spawnX = terrain.width * (id.toInt() + 1f) / 9f
+            val spawnY = terrain.stableSurfaceYAt(spawnX.toInt(), 10f).toFloat() - 10f
+
+            val newTank = Tank(id, Vector2(spawnX, spawnY), hp = 100, name = name, isBot = isBot, color = color)
+            players.add(newTank)
+            players.sortBy { it.id.toInt() }
+            return newTank
+        }
+    }
 
     fun recordElimination(playerId: Byte) {
         if (!eliminationOrder.contains(playerId)) eliminationOrder.add(playerId)
@@ -50,7 +69,7 @@ class GameState(
     fun applyExplosion(
         impactPoint: Vector2,
         shotType: Byte,
-        shotAngle: Float, // Correctly pass angle for bonus
+        shotAngle: Float,
         directTankId: Byte? = null
     ): ImpactReport {
         val config = shotConfig(shotType)
@@ -99,21 +118,14 @@ class GameState(
     fun settleTanksAfterTerrainChange(): List<FallReport> {
         val reports = mutableListOf<FallReport>()
         players.filter { it.hp > 0 }.forEach { tank ->
-            val surface = terrain.stableSurfaceYAt(tank.position.x, tank.radius)
-            val targetY = surface.toFloat() - tank.radius
-            val fall = targetY - tank.position.y
-            val buriedCorrection = tank.position.y - targetY
-            if (fall > 2f) {
+            val surfaceY = terrain.stableSurfaceYAt(tank.position.x.toInt(), tank.radius).toFloat() - tank.radius
+            if (surfaceY > tank.position.y) {
+                val dist = surfaceY - tank.position.y
                 val oldY = tank.position.y
-                tank.position = tank.position.copy(y = targetY)
-                val fallDamage = ((fall - 70f) / 22f).toInt().coerceAtLeast(0)
-                if (fallDamage > 0) {
-                    tank.hp = (tank.hp - fallDamage).coerceAtLeast(0)
-                    if (tank.hp <= 0) recordElimination(tank.id)
-                }
-                reports += FallReport(tank.id, oldY, targetY, fall, fallDamage)
-            } else if (buriedCorrection > 4f) {
-                tank.position = tank.position.copy(y = targetY)
+                tank.position = tank.position.copy(y = surfaceY)
+                val dmg = if (dist > 50) (dist * 0.15f).toInt() else 0
+                if (dmg > 0) tank.hp = (tank.hp - dmg).coerceAtLeast(0)
+                reports += FallReport(tank.id, oldY, surfaceY, dist, dmg)
             }
         }
         return reports

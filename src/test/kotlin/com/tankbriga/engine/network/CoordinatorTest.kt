@@ -11,6 +11,7 @@ class CoordinatorTest {
     fun `Election should elect player with lowest ID when coordinator dies`() {
         val players = mutableListOf<Byte>(0, 1, 2, 3)
         val node1 = CoordinatorNode(1, "LOBBY", players)
+        node1.failoverEnabled = true
         
         // Simulate heartbeats for everyone except current coord (0)
         node1.onHeartbeatReceived(1)
@@ -31,6 +32,7 @@ class CoordinatorTest {
     fun `Coordinator should sequence turns correctly`() {
         val players = mutableListOf<Byte>(1, 2)
         val node = CoordinatorNode(1, "LOBBY", players)
+        node.failoverEnabled = true
         
         // Force election so node 1 becomes coord
         node.onHeartbeatReceived(1)
@@ -41,5 +43,15 @@ class CoordinatorTest {
         // Turn sequencing should happen without crashing
         node.startNextTurn()
         node.startNextTurn()
+    }
+
+    @Test
+    fun `Coordinator should start with lowest player id`() {
+        val node = CoordinatorNode(0, "LOBBY", mutableListOf(0, 1, 2))
+        node.start()
+
+        node.startNextTurn()
+
+        assertEquals(0, node.currentTurnPlayerId)
     }
 }

@@ -19,7 +19,7 @@ class GunboundTerrainImpactTest {
         val state = GameState("TEST", terrain, mutableListOf(tank))
         val before = terrain.countSolidPixels()
 
-        val report = state.applyExplosion(Vector2(110f, 110f), shotType = 1, directTankId = null)
+        val report = state.applyExplosion(Vector2(110f, 110f), shotType = 1, shotAngle = 45f, directTankId = null)
 
         assertTrue(terrain.countSolidPixels() < before, "Bomb impact must open a visible crater")
         assertTrue(report.craterRadius >= 40, "Bomb crater must be large enough to read on mobile")
@@ -32,7 +32,7 @@ class GunboundTerrainImpactTest {
         val state = GameState("TEST", terrain, mutableListOf(tank))
         val oldY = tank.position.y
 
-        val report = state.applyExplosion(Vector2(110f, 110f), shotType = 1, directTankId = null)
+        val report = state.applyExplosion(Vector2(110f, 110f), shotType = 1, shotAngle = 45f, directTankId = null)
 
         assertTrue(tank.position.y > oldY, "Tank must drop when the crater removes the ground under it")
         assertTrue(report.falls.any { it.tankId == tank.id }, "Fall report must explain who fell")

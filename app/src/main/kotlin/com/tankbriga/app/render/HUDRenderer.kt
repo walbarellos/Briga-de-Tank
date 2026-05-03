@@ -9,7 +9,7 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /** Compact mobile controls. Keeps world visible and separates CAM, AIM, POWER and FIRE. */
-enum class HudControl { NONE, CAMERA, AIM, FIRE, POWER_BAR, ANGLE_UP, ANGLE_DOWN }
+enum class HudControl { NONE, CAMERA, AIM, FIRE, POWER_BAR, ANGLE_UP, ANGLE_DOWN, START_GAME }
 
 class HUDRenderer {
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -69,6 +69,11 @@ class HUDRenderer {
         if (angleUpRect(width, height, s).contains(x, y)) return HudControl.ANGLE_UP
         if (angleDownRect(width, height, s).contains(x, y)) return HudControl.ANGLE_DOWN
         if (powerRect(width, height, s).contains(x, y)) return HudControl.POWER_BAR
+        
+        // Check for START button in lobby
+        val startBtn = startButtonRect(width, height, s)
+        if (startBtn.contains(x, y)) return HudControl.START_GAME
+        
         return HudControl.NONE
     }
 
@@ -111,7 +116,8 @@ class HUDRenderer {
         currentPlayer: Tank?,
         remainingSeconds: Int,
         message: String?,
-        isCharging: Boolean
+        isCharging: Boolean,
+        isHost: Boolean = false
     ) {
         val s = uiScale(width, height)
         textPaint.textSize = 18f * s
@@ -124,15 +130,14 @@ class HUDRenderer {
         drawAimSlider(canvas, width, height, s, angle)
         drawAngleButtons(canvas, width, height, s)
         drawPower(canvas, width, height, s, power, isCharging)
-        if (phase == "LOBBY") drawLobbyOverlay(canvas, width, height, s, players)
+        if (phase == "LOBBY") drawLobbyOverlay(canvas, width, height, s, players, isHost)
         if (!message.isNullOrBlank()) drawMessage(canvas, width, height, s, message)
     }
 
-    private fun drawLobbyOverlay(canvas: Canvas, width: Int, height: Int, s: Float, players: List<Tank>) {
+    private fun drawLobbyOverlay(canvas: Canvas, width: Int, height: Int, s: Float, players: List<Tank>, isHost: Boolean) {
         val w = width.toFloat()
         val h = height.toFloat()
         
-        // Darken background
         canvas.drawRect(0f, 0f, w, h, Paint().apply { color = Color.BLACK; alpha = 180 })
         
         centerPaint.textSize = 32f * s
@@ -141,15 +146,20 @@ class HUDRenderer {
         smallPaint.textSize = 16f * s
         canvas.drawText("Aguardando amigos na mesma rede WiFi...", w / 2f, h * 0.32f, smallPaint)
         
-        // List Players
         val startY = h * 0.45f
         players.forEachIndexed { i, p ->
             textPaint.setColor(p.color)
             textPaint.textSize = 22f * s
-            canvas.drawText("${i+1}. ${p.name}", w / 2f - 100f * s, startY + i * 40f * s, textPaint)
+            canvas.drawText("${i+1}. ${p.name}", w / 2f, startY + i * 40f * s, centerPaint)
         }
         
-        if (players.size >= 2) {
+        if (isHost) {
+            val rect = startButtonRect(width, height, s)
+            canvas.drawRoundRect(rect, 12f * s, 12f * s, greenPaint)
+            canvas.drawRoundRect(rect, 12f * s, 12f * s, strokePaint)
+            centerPaint.textSize = 20f * s
+            canvas.drawText("INICIAR PARTIDA", rect.centerX(), rect.centerY() + 8f * s, centerPaint)
+        } else if (players.size >= 2) {
             yellowPaint.textSize = 18f * s
             canvas.drawText("AGUARDANDO HOST INICIAR...", w / 2f, h * 0.85f, centerPaint.apply { setColor(Color.YELLOW) })
         }
@@ -294,6 +304,7 @@ class HUDRenderer {
     private fun angleUpRect(width: Int, height: Int, s: Float) = RectF(18f * s, height - 180f * s, 64f * s, height - 130f * s)
     private fun angleDownRect(width: Int, height: Int, s: Float) = RectF(18f * s, height - 110f * s, 64f * s, height - 60f * s)
     private fun powerRect(width: Int, height: Int, s: Float) = RectF(width * 0.24f, height - 64f * s, width * 0.70f, height - 30f * s)
+    private fun startButtonRect(width: Int, height: Int, s: Float) = RectF(width/2f - 110f * s, height * 0.75f, width/2f + 110f * s, height * 0.75f + 50f * s)
 
     private data class Circle(val x: Float, val y: Float, val r: Float)
     private fun fireCircle(width: Int, height: Int, s: Float) = Circle(width - 62f * s, height - 62f * s, 36f * s)

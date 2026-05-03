@@ -25,6 +25,8 @@ class RoomDiscovery(
     private var listeningJob: Job? = null
     private var announcingJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var currentPlayerCount: Int = 1
+    @Volatile private var currentCountdown: Int = 45
 
     private fun acquireMulticastLock() {
         try {
@@ -66,10 +68,10 @@ class RoomDiscovery(
             ?.flatMap { it.inetAddresses.asSequence() }
             ?.firstOrNull { addr ->
                 !addr.isLoopbackAddress &&
-                addr is Inet4Address &&
-                addr.hostAddress?.startsWith("192.") == true ||
-                addr.hostAddress?.startsWith("10.") == true ||
-                addr.hostAddress?.startsWith("172.") == true
+                    addr is Inet4Address &&
+                    (addr.hostAddress?.startsWith("192.") == true ||
+                        addr.hostAddress?.startsWith("10.") == true ||
+                        addr.hostAddress?.startsWith("172.") == true)
             }?.hostAddress
     }
 
@@ -78,12 +80,11 @@ class RoomDiscovery(
     fun startAnnouncing(playerCount: Int, countdown: Int) {
         acquireMulticastLock()
         announcingJob?.cancel()
+        currentPlayerCount = playerCount
+        currentCountdown = countdown
         val myIp = getWifiIp()
 
         announcingJob = scope.launch {
-            val announce = RoomAnnounce(lobbyWord, myIp, 45679, playerCount, countdown)
-            val payload = Json.encodeToString(announce).toByteArray()
-
             // Tenta multicast primeiro, fallback para broadcast
             val mcSocket = try {
                 DatagramSocket().apply { broadcast = true }
@@ -91,6 +92,9 @@ class RoomDiscovery(
 
             while (isActive) {
                 try {
+                    val announce = RoomAnnounce(lobbyWord, myIp, 45679, currentPlayerCount, currentCountdown)
+                    val payload = Json.encodeToString(announce).toByteArray()
+
                     // Multicast (funciona na maioria das redes)
                     mcSocket?.send(DatagramPacket(payload, payload.size, group, DISCOVERY_PORT))
 
@@ -103,6 +107,10 @@ class RoomDiscovery(
             }
             mcSocket?.close()
         }
+    }
+
+    fun updatePlayerCount(playerCount: Int) {
+        currentPlayerCount = playerCount.coerceIn(1, 8)
     }
 
     // ── Listening ─────────────────────────────────────────────────────────────

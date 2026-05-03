@@ -43,7 +43,10 @@ object MatchFactory {
 
     /** Creates only the local player for a multiplayer room. */
     fun createMultiplayerLocal(terrain: Terrain, name: String, id: Byte): MutableList<Tank> {
-        val x = terrain.width * 0.15f // Initial position for local player
+        // FIX: Position offset by ID to prevent overlap
+        val margin = terrain.width * 0.12f
+        val x = margin + (id.toInt() % 8) * (terrain.width * 0.1f)
+        
         return mutableListOf(
             Tank(
                 id = id,
@@ -52,7 +55,7 @@ object MatchFactory {
                 radius = 15f,
                 name = name,
                 isBot = false,
-                color = 0xFF33B5E5.toInt()
+                color = 0xFF33B5E5.toInt() // Local player always cyan
             )
         )
     }

@@ -22,6 +22,9 @@ class Terrain(val width: Int, val height: Int) {
      */
     fun generate(seed: Long) {
         data.clear()
+        craterCentersX.clear()
+        craterCentersY.clear()
+        craterRadii.clear()
         val rng = java.util.Random(seed)
         val baseHeight = height * 0.6f
         val variance = height * 0.2f
@@ -59,9 +62,9 @@ class Terrain(val width: Int, val height: Int) {
      * We sample the center and two side columns. If a crater opens below the center,
      * the tank drops to the lowest available supporting point, Gunbound-style.
      */
-    fun stableSurfaceYAt(centerX: Float, tankRadius: Float): Int {
+    fun stableSurfaceYAt(centerX: Int, tankRadius: Float): Int {
         val samples = intArrayOf(
-            centerX.toInt(),
+            centerX,
             (centerX - tankRadius * 0.55f).toInt(),
             (centerX + tankRadius * 0.55f).toInt()
         )
@@ -69,8 +72,8 @@ class Terrain(val width: Int, val height: Int) {
     }
 
     fun placeOnSurface(x: Float, verticalOffset: Float = 14f): Vector2 {
-        val sx = x.coerceIn(0f, (width - 1).toFloat())
-        return Vector2(sx, stableSurfaceYAt(sx, verticalOffset).toFloat() - verticalOffset)
+        val sx = x.coerceIn(0f, (width - 1).toFloat()).toInt()
+        return Vector2(sx.toFloat(), stableSurfaceYAt(sx, verticalOffset).toFloat() - verticalOffset)
     }
 
     /** Erodes a circular area of the terrain and returns how many solid pixels were removed. */

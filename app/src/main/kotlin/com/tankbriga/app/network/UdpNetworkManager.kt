@@ -1,25 +1,15 @@
 package com.tankbriga.app.network
 
 import android.content.Context
+import android.util.Log
 import com.tankbriga.engine.network.*
 import kotlinx.coroutines.*
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.SocketTimeoutException
 
-/**
- * Network Manager — corrigido e com suporte a reconexão.
- *
- * FIXES aplicados:
- *  1. Lobby presence enviado na porta correta (45679 → peers ouvem em 45679)
- *  2. validateSequence() agora chamado em todos os pacotes
- *  3. Heartbeats delegados ao CoordinatorNode (que agora tem loop real)
- *  4. sendUnicast() exposto para rejoin (antes tudo era multicast)
- *  5. Fluxo REJOIN_REQ / REJOIN_ACK implementado
- *  6. CoordinatorNode recebe onBroadcast/onBuildSnapshot callbacks
- */
+/** Coordinates multiplayer services while delegating transport, routing, membership and reliability. */
 class UdpNetworkManager(
     private val lobbyWord: String,
     private val localName: String,
@@ -27,16 +17,25 @@ class UdpNetworkManager(
     private val port: Int = 45679,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) {
-    private var socket: DatagramSocket? = null
-    private val GROUP_ADDR = "239.255.0.1"
-    private val group = InetAddress.getByName(GROUP_ADDR)
+    private val transport = AndroidUdpTransport(context, port)
 
     val peerRegistry = PeerRegistry()
-    private val rateLimiter = RateLimiter(25)
+    private val rateLimiter = RateLimiter(30)
+    private val ingressGate = PacketIngressGate(peerRegistry) { localPlayerId }
 
     var localPlayerId: Byte = 0
         private set
-    private var localSeq: Short = 0
+    private var isLobbyLoopActive = false
+    private val ackTracker = NetworkAckTracker()
+    private val deduplicator = PacketDeduplicator()
+    private val debugState = NetworkDebugState()
+    private val retryBroadcaster = RetryBroadcaster(scope)
+    private val reliableUdp by lazy { transport.socket?.let { ReliableUdp(it, scope) } }
+    private val secureSender = SecurePacketSender(
+        transport = transport,
+        reliableUdp = { reliableUdp },
+        localPlayerId = { localPlayerId }
+    )
 
     val coordinator = CoordinatorNode(
         myId = localPlayerId,
@@ -44,263 +43,299 @@ class UdpNetworkManager(
         players = mutableListOf()
     )
 
-    // Reliable layer só para pacotes críticos
-    private val reliableUdp by lazy { socket?.let { ReliableUdp(it, scope) } }
-
-    // ── Callbacks para a UI / GameView ────────────────────────────────────────
-
+    private val gameplayRouter = GameplayPacketRouter(
+        lobbyWord = lobbyWord,
+        coordinator = coordinator,
+        ackTracker = ackTracker,
+        deduplicator = deduplicator,
+        debugState = debugState,
+        isActionTurnAcceptable = { isActionTurnAcceptable(it) },
+        sendProtocolAck = { address, type, turnNumber, shotId -> sendProtocolAck(address, type, turnNumber, shotId) },
+        sendTransportAck = { address, seq -> sendAck(address, seq) },
+        stopLobbyPresence = { stopLobbyPresenceLoop() },
+        lockRoster = { peerRegistry.lockRoster() },
+        publishDebug = { publishDebug() },
+        forwardAction = { sendActionForward(it) },
+        onActionReceived = { onActionReceived?.invoke(it) },
+        onGameStart = { onGameStart?.invoke() },
+        onTurnStart = { onTurnStart?.invoke(it) },
+        onLobbySnapshot = { onLobbySnapshot?.invoke(it) },
+        onShotResolved = { onShotResolved?.invoke(it) },
+        onAimState = { onAimState?.invoke(it) },
+        onRejoinSnapshot = { onRejoinSnapshot?.invoke(it) }
+    )
+    private val lobbyMembership = LobbyMembershipController(
+        localName = localName,
+        peerRegistry = peerRegistry,
+        coordinator = coordinator,
+        localPlayerId = { localPlayerId },
+        setLocalPlayerId = { setLocalId(it) },
+        onReliableAck = { reliableUdp?.onAckReceived(it) },
+        sendSecuredTo = { payload, address -> secureSender.sendTo(payload, address) },
+        onLocalIdAssigned = { oldId, newId -> onLocalIdAssigned?.invoke(oldId, newId) },
+        onPlayerJoined = { name, ip, id -> onPlayerJoined?.invoke(name, ip, id) }
+    )
+    private val rejoinController = RejoinController(
+        lobbyWord = lobbyWord,
+        localName = localName,
+        peerRegistry = peerRegistry,
+        coordinator = coordinator,
+        localPlayerId = { localPlayerId },
+        sendRawTo = { payload, address -> transport.sendTo(payload, address) }
+    )
     var onPlayerJoined:    ((name: String, ip: String, id: Byte) -> Unit)? = null
     var onActionReceived:  ((com.tankbriga.engine.ActionPacket) -> Unit)?  = null
     var onGameStart:       (() -> Unit)?                                   = null
     var onResyncRequest:   ((remoteHash: Int) -> Unit)?                    = null
     var onRejoinSnapshot:  ((RejoinSnapshot) -> Unit)?                     = null
     var onTurnStart:       ((TurnStartPacket) -> Unit)?                    = null
-
-    // ── Start ──────────────────────────────────────────────────────────────────
+    var onLobbySnapshot:   ((LobbySnapshot) -> Unit)?                      = null
+    var onShotResolved:    ((ShotResolvePacket) -> Unit)?                  = null
+    var onLocalIdAssigned: ((oldId: Byte, newId: Byte) -> Unit)?           = null
+    var onAimState:        ((AimStatePacket) -> Unit)?                     = null
+    var onDebugChanged:    ((String) -> Unit)?                             = null
 
     fun start() {
         SessionSecurity.init(lobbyWord)
+        transport.start()
 
-        socket = DatagramSocket(port).apply {
-            broadcast = true
-            soTimeout = 300
+        coordinator.onBroadcast = { payload ->
+            if (payload.firstOrNull() == PktType.TURN_START.id) broadcastTurnStartReliably(payload)
+            else secureSender.broadcast(payload)
         }
-
-        // Wire coordinator → network
-        coordinator.onBroadcast = { payload -> broadcastSecured(payload) }
         coordinator.onTurnStart = { pkt -> onTurnStart?.invoke(pkt) }
-        coordinator.onPanicFire = { id -> }
         coordinator.start()
 
-        // Loop de recebimento
+        // Receiver loop
         scope.launch {
             val buffer = ByteArray(4096)
             while (isActive) {
                 try {
-                    val pkt = DatagramPacket(buffer, buffer.size)
-                    socket?.receive(pkt)
+                    val pkt = transport.receive(buffer) ?: continue
                     val ip = pkt.address.hostAddress ?: continue
                     if (rateLimiter.allow(ip)) processPacket(pkt)
-                } catch (_: Exception) { }
+                } catch (_: SocketTimeoutException) {
+                } catch (e: Exception) {
+                    Log.w("TankBriga", "UDP receive loop error", e)
+                }
             }
         }
 
-        // Retry loop para pacotes confiáveis
+        // Reliable retry loop
         scope.launch {
             while (isActive) {
                 reliableUdp?.retryPending()
                 delay(150)
             }
         }
+
+        startLobbyPresenceLoop()
     }
 
-    // ── Processamento de pacotes ───────────────────────────────────────────────
+    private fun startLobbyPresenceLoop() {
+        isLobbyLoopActive = true
+        scope.launch {
+            while (isLobbyLoopActive && isActive) {
+                broadcastLobbyPresence()
+                delay(2000)
+            }
+        }
+    }
+
+    fun stopLobbyPresenceLoop() {
+        isLobbyLoopActive = false
+    }
 
     private fun processPacket(pkt: DatagramPacket) {
-        val raw = pkt.data.copyOf(pkt.length)
-        val ip  = pkt.address.hostAddress ?: return
-
-        // Pacotes de lobby/discovery chegam sem envelope seguro
-        if (raw.isNotEmpty() && raw[0] == PktType.ROOM_ANNOUNCE.id.toByte()) {
-            handleLobbyAnnounce(raw, ip); return
+        when (val ingress = ingressGate.classify(pkt)) {
+            PacketIngress.Ignore -> return
+            is PacketIngress.Rejoin -> rejoinController.handle(ingress.raw, ingress.ip)
+            is PacketIngress.JoinRequest -> lobbyMembership.handleJoinRequest(ingress.address, ingress.playerId, ingress.payload)
+            is PacketIngress.JoinAck -> lobbyMembership.handleJoinAck(ingress)
+            is PacketIngress.Routed -> gameplayRouter.route(ingress.envelope, ingress.address)
         }
-
-        // Rejoin request pode vir sem autenticação (player perdeu sessão)
-        if (raw.isNotEmpty() && raw[0] == PktType.REJOIN_REQ.id) {
-            handleRejoinRequest(raw, ip, pkt.address); return
-        }
-
-        val envelope = SecureEnvelope.fromBinary(raw) ?: return
-        if (!SessionSecurity.verify(envelope.payload, envelope.playerId, envelope.seq, envelope.signature)) return
-
-        // FIX: validateSequence agora chamado (antes nunca era chamado)
-        if (!peerRegistry.validateSequence(envelope.playerId, envelope.seq)) return
-
-        // ACK de pacote confiável
-        if (envelope.payload.firstOrNull() == PktType.JOIN_ACK.id) {
-            val ackedSeq = readShort(envelope.payload, 1)
-            reliableUdp?.onAckReceived(ackedSeq)
-            return
-        }
-
-        // Peer não autorizado → tenta handshake de join
-        if (!peerRegistry.isAuthorized(envelope.playerId, ip)) {
-            if (envelope.payload.firstOrNull() == PktType.JOIN_REQ.id) {
-                handleJoinRequest(pkt.address, envelope.playerId, envelope.payload)
-            }
-            return
-        }
-
-        routePayload(envelope, ip, pkt.address)
-    }
-
-    private fun routePayload(envelope: SecureEnvelope, ip: String, address: InetAddress) {
-        val p = envelope.payload
-        when (p.firstOrNull()) {
-            PktType.HEARTBEAT.id -> {
-                coordinator.onHeartbeatReceived(p.getOrElse(1) { envelope.playerId })
-            }
-            PktType.COORD_ELECTED.id -> {
-                val json = String(p, 1, p.size - 1)
-                runCatching { Json.decodeFromString<CoordElectedPacket>(json) }
-                    .onSuccess { coordinator.onCoordElected(it) }
-            }
-            PktType.TURN_START.id -> {
-                val json = String(p, 1, p.size - 1)
-                runCatching { Json.decodeFromString<TurnStartPacket>(json) }
-                    .onSuccess { onTurnStart?.invoke(it) }
-            }
-            PktType.ACTION.id -> {
-                if (envelope.playerId == coordinator.currentTurnPlayerId) {
-                    p.copyOfRange(1, 9).toActionPacket()?.let { action ->
-                        coordinator.onActionReceived()
-                        onActionReceived?.invoke(action)
-                    }
-                }
-            }
-            PktType.ACTION_FWRD.id -> {
-                p.copyOfRange(1, 9).toActionPacket()?.let { onActionReceived?.invoke(it) }
-            }
-            PktType.GAME_START.id -> {
-                sendAck(address, envelope.seq)
-                onGameStart?.invoke()
-            }
-            PktType.RESYNC_REQ.id -> {
-                if (p.size >= 5) {
-                    val hash = readInt(p, 1)
-                    onResyncRequest?.invoke(hash)
-                }
-            }
-            PktType.REJOIN_ACK.id -> {
-                val json = String(p, 1, p.size - 1)
-                runCatching { Json.decodeFromString<RejoinSnapshot>(json) }
-                    .onSuccess { onRejoinSnapshot?.invoke(it) }
-            }
-            PktType.REJOIN_DENIED.id -> { }
-        }
-    }
-
-    // ── Join / Lobby ───────────────────────────────────────────────────────────
-
-    private fun handleLobbyAnnounce(raw: ByteArray, ip: String) { }
-
-    private fun handleJoinRequest(address: InetAddress, playerId: Byte, payload: ByteArray) {
-        val name = if (payload.size > 1) String(payload, 1, payload.size - 1) else "P$playerId"
-        val ip = address.hostAddress ?: return
-
-        peerRegistry.addPeer(playerId, ip)
-
-        val response = ByteArray(1 + localName.toByteArray().size)
-        response[0] = PktType.JOIN_ACK.id
-        localName.toByteArray().copyInto(response, 1)
-        sendSecuredTo(response, address, reliable = false)
-
-        onPlayerJoined?.invoke(name, ip, playerId)
     }
 
     fun broadcastLobbyPresence() {
-        val nameBytes = localName.toByteArray()
-        val payload = ByteArray(1 + nameBytes.size)
-        payload[0] = PktType.JOIN_REQ.id
-        nameBytes.copyInto(payload, 1)
-        broadcastSecured(payload)
+        secureSender.broadcast(ProtocolPayloads.joinRequest(localName))
     }
-
-    // ── Reconexão ─────────────────────────────────────────────────────────────
 
     fun requestRejoin(coordinatorIp: String) {
         scope.launch {
-            val req = RejoinRequest(lobbyWord, localPlayerId, localName)
-            val json = Json.encodeToString(req).toByteArray()
-            val payload = ByteArray(1 + json.size)
-            payload[0] = PktType.REJOIN_REQ.id
-            json.copyInto(payload, 1)
-
-            val raw = payload
-            socket?.send(DatagramPacket(raw, raw.size, InetAddress.getByName(coordinatorIp), port))
+            rejoinController.request(coordinatorIp)
         }
     }
-
-    private fun handleRejoinRequest(raw: ByteArray, ip: String, address: InetAddress) {
-        if (!coordinator.isCoordinator) return
-        val json = String(raw, 1, raw.size - 1)
-        val req = runCatching { Json.decodeFromString<RejoinRequest>(json) }.getOrNull() ?: return
-
-        coordinator.onRejoinRequest(req, ip) { responsePayload, targetIp ->
-            try {
-                val targetAddr = InetAddress.getByName(targetIp)
-                socket?.send(DatagramPacket(responsePayload, responsePayload.size, targetAddr, port))
-            } catch (_: Exception) { }
-        }
-        peerRegistry.allowRejoin(req.playerId, ip)
-    }
-
-    // ── Envio ──────────────────────────────────────────────────────────────────
 
     fun sendAction(action: com.tankbriga.engine.ActionPacket) {
         scope.launch {
-            localSeq++
-            val bin = action.toBinary()
-            val payload = ByteArray(1 + bin.size)
-            payload[0] = PktType.ACTION.id
-            bin.copyInto(payload, 1)
-            broadcastSecured(payload)
+            val payload = ProtocolPayloads.action(PktType.ACTION, action)
+            if (coordinator.isCoordinator && isActionTurnAcceptable(action.playerId)) {
+                coordinator.onActionReceived()
+                sendActionForward(action)
+                onActionReceived?.invoke(action)
+            } else {
+                secureSender.broadcast(payload)
+                sendPayloadToPeers(payload, excludeIds = setOf(localPlayerId))
+            }
+        }
+    }
+
+    private fun sendActionForward(action: com.tankbriga.engine.ActionPacket) {
+        val payload = ProtocolPayloads.action(PktType.ACTION_FWRD, action)
+        val expected = expectedAckPeerIds().filter { it != action.playerId }
+        ackTracker.beginAction(action.seq)
+        debugState.lastActionInfo = "SEND FWD P${action.playerId}#${action.seq}"
+        publishDebug()
+        retryBroadcaster.launch(
+            policy = MultiplayerRetryPolicies.ACTION_FORWARD,
+            sendOnce = {
+                secureSender.broadcast(payload)
+                sendPayloadToPeers(payload, excludeIds = setOf(localPlayerId))
+            },
+            isComplete = { ackTracker.hasActionAcks(action.seq, expected) }
+        )
+    }
+
+    private fun isActionTurnAcceptable(playerId: Byte): Boolean {
+        val current = coordinator.currentTurnPlayerId
+        return current == (-1).toByte() || current == playerId
+    }
+
+    fun sendAimState(packet: AimStatePacket) {
+        scope.launch {
+            val payload = ProtocolPayloads.json(PktType.AIM_STATE, packet)
+            secureSender.broadcast(payload)
         }
     }
 
     fun sendStartSignal() {
         scope.launch {
-            localSeq++
+            val deadline = System.currentTimeMillis() + MultiplayerRetryPolicies.START_WAIT_FOR_LOBBY_ACK_MS
+            while (expectedAckPeerIds().isNotEmpty() &&
+                !ackTracker.hasLobbyAcks(expectedAckPeerIds()) &&
+                System.currentTimeMillis() < deadline
+            ) {
+                delay(100)
+            }
             peerRegistry.lockRoster()
+            stopLobbyPresenceLoop()
             val payload = byteArrayOf(PktType.GAME_START.id)
-            broadcastSecured(payload, reliable = true)
+            secureSender.broadcast(payload, reliable = true)
+            delay(100)
+            onGameStart?.invoke()
         }
     }
 
-    private fun broadcastSecured(payload: ByteArray, reliable: Boolean = false) {
-        localSeq++
-        val sig = SessionSecurity.sign(payload, localPlayerId, localSeq)
-        val envelope = SecureEnvelope(localPlayerId, localSeq, sig, payload)
-        val data = envelope.toBinary()
-        if (reliable) reliableUdp?.sendReliable(data, group, localSeq)
-        else try { socket?.send(DatagramPacket(data, data.size, group, port)) } catch (_: Exception) { }
+    fun sendLobbySnapshot(snapshot: LobbySnapshot) {
+        scope.launch {
+            val payload = ProtocolPayloads.json(PktType.LOBBY_SNAPSHOT, snapshot)
+            ackTracker.beginLobby(snapshot.lobbyWord)
+            debugState.lastLobbyInfo = "SEND players=${snapshot.players.size}"
+            publishDebug()
+            retryBroadcaster.launch(
+                policy = MultiplayerRetryPolicies.LOBBY_SNAPSHOT,
+                sendOnce = {
+                    secureSender.broadcast(payload)
+                    sendPayloadToPeers(payload, excludeIds = setOf(localPlayerId))
+                },
+                isComplete = { ackTracker.hasLobbyAcks(expectedAckPeerIds()) }
+            )
+        }
     }
 
-    private fun sendSecuredTo(payload: ByteArray, address: InetAddress, reliable: Boolean = false) {
-        localSeq++
-        val sig = SessionSecurity.sign(payload, localPlayerId, localSeq)
-        val envelope = SecureEnvelope(localPlayerId, localSeq, sig, payload)
-        val data = envelope.toBinary()
-        if (reliable) reliableUdp?.sendReliable(data, address, localSeq)
-        else try { socket?.send(DatagramPacket(data, data.size, address, port)) } catch (_: Exception) { }
+    fun sendShotResolve(packet: ShotResolvePacket) {
+        scope.launch {
+            val payload = ProtocolPayloads.json(PktType.SHOT_RESOLVE, packet)
+            val expected = expectedAckPeerIds()
+            ackTracker.beginResolve(packet.shotId)
+            debugState.lastResolveInfo = "SEND P${packet.shooterId}#${packet.shotId}"
+            publishDebug()
+            retryBroadcaster.launch(
+                policy = MultiplayerRetryPolicies.SHOT_RESOLVE,
+                sendOnce = {
+                    secureSender.broadcast(payload)
+                    sendPayloadToPeers(payload, excludeIds = setOf(localPlayerId))
+                },
+                isComplete = { ackTracker.hasResolveAcks(packet.shotId, expected) }
+            )
+        }
+    }
+
+    fun isCoordinator(): Boolean = coordinator.isCoordinator
+
+    /** Called by GameView when an impact is fully resolved to advance turn. */
+    fun notifyImpactResolved() {
+        if (coordinator.isCoordinator) {
+            scope.launch {
+                delay(500)
+                coordinator.startNextTurn()
+            }
+        }
+    }
+
+    private fun broadcastTurnStartReliably(payload: ByteArray) {
+        val json = String(payload, 1, payload.size - 1)
+        val pkt = runCatching { Json.decodeFromString<TurnStartPacket>(json) }.getOrNull()
+        ackTracker.beginTurn(pkt?.turnNumber ?: ackTracker.pendingTurnNumber)
+        debugState.lastTurnStartInfo = "SEND T${ackTracker.pendingTurnNumber}:P${pkt?.playerId}"
+        publishDebug()
+
+        retryBroadcaster.launch(
+            policy = MultiplayerRetryPolicies.TURN_START,
+            sendOnce = {
+                secureSender.broadcast(payload)
+                sendPayloadToPeers(payload, excludeIds = setOf(localPlayerId))
+            },
+            isComplete = { ackTracker.hasTurnAcks(expectedAckPeerIds()) }
+        )
+    }
+
+    private fun sendPayloadToPeers(payload: ByteArray, excludeIds: Set<Byte> = emptySet()) {
+        peerRegistry.getAllPeerIds()
+            .filterNot { it in excludeIds }
+            .forEach { id ->
+                val ip = peerRegistry.getPeerIp(id) ?: return@forEach
+                if (ip == "127.0.0.1") return@forEach
+                try { secureSender.sendTo(payload, InetAddress.getByName(ip)) } catch (_: Exception) { }
+            }
+    }
+
+    private fun sendProtocolAck(address: InetAddress, type: PktType, turnNumber: Short, shotId: Short) {
+        secureSender.sendTo(ProtocolPayloads.ack(type, turnNumber, shotId), address)
+    }
+
+    private fun expectedAckPeerIds(): List<Byte> =
+        peerRegistry.getAllPeerIds().filter { id -> id != localPlayerId && peerRegistry.getPeerIp(id) != "127.0.0.1" }
+
+    private fun publishDebug() {
+        val expected = expectedAckPeerIds()
+        onDebugChanged?.invoke(debugState.render(
+            localPlayerId = localPlayerId,
+            isCoordinator = coordinator.isCoordinator,
+            currentTurnPlayerId = coordinator.currentTurnPlayerId,
+            turnNumber = coordinator.turnNumber,
+            expectedPeers = expected.size,
+            acks = ackTracker
+        ))
     }
 
     private fun sendAck(address: InetAddress, seq: Short) {
-        val payload = ByteArray(3)
-        payload[0] = PktType.JOIN_ACK.id
-        payload[1] = (seq.toInt() shr 8).toByte()
-        payload[2] = (seq.toInt() and 0xFF).toByte()
-        sendSecuredTo(payload, address)
+        secureSender.sendTo(ProtocolPayloads.transportAck(seq), address)
     }
 
     fun setLocalId(id: Byte) {
         localPlayerId = id
+        coordinator.myId = id
+        coordinator.registerPlayer(id)
+        coordinator.setInitialCoordinator(0)
         peerRegistry.addPeer(id, "127.0.0.1")
     }
 
     fun stop() {
+        stopLobbyPresenceLoop()
         coordinator.stop()
         reliableUdp?.stop()
         scope.cancel()
-        socket?.close()
+        transport.stop()
     }
-
-    private fun readShort(buf: ByteArray, offset: Int): Short =
-        (((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)).toShort()
-
-    private fun readInt(buf: ByteArray, offset: Int): Int =
-        ((buf[offset].toInt() and 0xFF) shl 24) or
-        ((buf[offset + 1].toInt() and 0xFF) shl 16) or
-        ((buf[offset + 2].toInt() and 0xFF) shl 8) or
-        (buf[offset + 3].toInt() and 0xFF)
 }

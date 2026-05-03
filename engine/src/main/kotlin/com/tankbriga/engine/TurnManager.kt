@@ -10,50 +10,48 @@ class TurnManager(
     private val gameState: GameState,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
 ) {
-    companion object { const val TURN_SECONDS = 45 }
-    private var timerJob: Job? = null
-    val remainingSeconds = AtomicInteger(TURN_SECONDS)
+    companion object {
+        const val TURN_SECONDS = 15
+    }
 
-    var onTimeout: (() -> Unit)? = null
+    private var countdownJob: Job? = null
+    internal val remainingSeconds = AtomicInteger(TURN_SECONDS)
+
     var onTick: ((Int) -> Unit)? = null
+    var onTimeout: (() -> Unit)? = null
 
-    /**
-     * Starts the mobile-friendly countdown for the current turn.
-     */
-    fun startCountdown() {
-        timerJob?.cancel()
-        remainingSeconds.set(TURN_SECONDS)
-        
-        timerJob = scope.launch {
-            while (remainingSeconds.get() > 0) {
+    fun startCountdown(durationMs: Int = TURN_SECONDS * 1000) {
+        stopCountdown()
+        val seconds = (durationMs / 1000f).toInt().coerceAtLeast(1)
+        remainingSeconds.set(seconds)
+        countdownJob = scope.launch {
+            while (isActive && remainingSeconds.get() > 0) {
                 onTick?.invoke(remainingSeconds.get())
                 delay(1000)
                 remainingSeconds.decrementAndGet()
             }
-            onTick?.invoke(0) // Ensure 0 is emitted
-            onTimeout?.invoke()
+            if (remainingSeconds.get() <= 0) {
+                onTimeout?.invoke()
+            }
         }
     }
 
     fun stopCountdown() {
-        timerJob?.cancel()
+        countdownJob?.cancel()
     }
 
-    /**
-     * Moves the match to the next player's turn.
-     */
     fun nextTurn() {
+        stopCountdown()
+        gameState.turnNumber++
         val alive = gameState.getAlivePlayersSorted()
         if (alive.isEmpty()) return
 
-        gameState.turnNumber++
-        val index = ((gameState.turnNumber - 1) % alive.size).coerceAtLeast(0)
-        gameState.currentTurnPlayerId = alive[index].id
+        gameState.currentTurnPlayerId = alive[(gameState.turnNumber - 1) % alive.size].id
         
-        // Deterministic Gunbound-like wind.
+        // Use deterministic wind
         DeterministicRng.init(gameState.lobbyWord, gameState.turnNumber)
-        gameState.windState = DeterministicRng.windVectorForTurn()
-        gameState.wind = gameState.windState.horizontalComponent()
+        val windValue = DeterministicRng.windForTurn()
+        gameState.windState.setWind(windValue)
         
         gameState.phase = MatchPhase.PLAYER_TURN
         startCountdown()
