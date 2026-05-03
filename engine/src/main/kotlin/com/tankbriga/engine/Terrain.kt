@@ -12,6 +12,14 @@ class Terrain(val width: Int, val height: Int) {
     private val craterCentersX = mutableListOf<Int>()
     private val craterCentersY = mutableListOf<Int>()
     private val craterRadii = mutableListOf<Int>()
+
+    // Surface cache: surfaceCache[x] = first solid y in column x.
+    // Eliminates O(height) scan in surfaceYAt — now O(1).
+    val surfaceCache = IntArray(width) { height - 1 }
+    private var surfaceCacheValid = false
+
+    // Shared RNG — avoids new Random() per circleErode call (was GC pressure)
+    private val erodeRng = java.util.Random(0L)
     
     var currentBiome: Biome = Biome.LUSH_VALLEY
         private set
@@ -28,6 +36,7 @@ class Terrain(val width: Int, val height: Int) {
         craterCentersX.clear()
         craterCentersY.clear()
         craterRadii.clear()
+        surfaceCacheValid = false
         currentBiome = biome
         val rng = java.util.Random(seed)
         
@@ -54,21 +63,26 @@ class Terrain(val width: Int, val height: Int) {
 
             val clampedH = h.coerceIn((height * 0.3f).toInt(), height - 1)
             for (y in clampedH until height) setSolid(x, y, true)
+            surfaceCache[x] = clampedH
         }
+        surfaceCacheValid = true
     }
 
+    // Inline bounds check — avoids IntRange allocation from `x !in 0 until width`
     fun isSolid(x: Int, y: Int): Boolean {
-        if (x !in 0 until width || y !in 0 until height) return false
+        if (x < 0 || x >= width || y < 0 || y >= height) return false
         return data.get(y * width + x)
     }
 
     fun setSolid(x: Int, y: Int, solid: Boolean) {
-        if (x in 0 until width && y in 0 until height) data.set(y * width + x, solid)
+        if (x < 0 || x >= width || y < 0 || y >= height) return
+        data.set(y * width + x, solid)
     }
 
-    /** Returns the first solid pixel in a column. Used to place tanks on the terrain surface. */
+    /** O(1) surface lookup using cache. Falls back to scan if cache invalid. */
     fun surfaceYAt(x: Int): Int {
         val sx = x.coerceIn(0, width - 1)
+        if (surfaceCacheValid) return surfaceCache[sx]
         for (y in 0 until height) if (isSolid(sx, y)) return y
         return height - 1
     }
@@ -98,28 +112,32 @@ class Terrain(val width: Int, val height: Int) {
         craterCentersX.add(centerX)
         craterCentersY.add(centerY)
         craterRadii.add(radius)
-        
+
         var removed = 0
         val r2 = (radius * radius).toFloat()
-        
-        // Use a deterministic seed for the noise based on impact location
-        val rng = java.util.Random((centerX xor centerY).toLong())
-        
+        erodeRng.setSeed((centerX xor centerY).toLong())  // deterministic but reuses instance
+
         for (dx in -radius - 5..radius + 5) {
             for (dy in -radius - 5..radius + 5) {
                 val distSq = (dx * dx + dy * dy).toFloat()
-                
-                // Add noise to the boundary (last 35% of the radius)
-                val noise = if (distSq > r2 * 0.65f) {
-                    rng.nextFloat() * (radius * 3.5f)
-                } else 0f
-                
+                val noise = if (distSq > r2 * 0.65f) erodeRng.nextFloat() * (radius * 3.5f) else 0f
                 if (distSq <= r2 + noise) {
                     val x = centerX + dx
                     val y = centerY + dy
                     if (isSolid(x, y)) {
                         setSolid(x, y, false)
                         removed++
+                        // Update surface cache for this column
+                        if (surfaceCacheValid && x in 0 until width) {
+                            if (y <= surfaceCache[x]) {
+                                // Surface was removed — rescan this column from y down
+                                var newSurface = height - 1
+                                for (sy in y until height) {
+                                    if (isSolid(x, sy)) { newSurface = sy; break }
+                                }
+                                surfaceCache[x] = newSurface
+                            }
+                        }
                     }
                 }
             }
