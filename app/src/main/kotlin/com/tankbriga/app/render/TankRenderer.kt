@@ -58,7 +58,11 @@ class TankRenderer(context: Context? = null) {
         isHuman: Boolean = !tank.isBot
     ) {
         val x = tank.position.x
-        val y = tank.position.y
+        
+        // Fix 4 — Idle animation do tank
+        val isIdle = !isCurrentTurn && tank.hp > 0
+        val idleOffset = if (isIdle) (sin(System.currentTimeMillis() / 200.0) * 1.5).toFloat() else 0f
+        val y = tank.position.y + idleOffset
 
         // Markers
         if (isHuman) canvas.drawCircle(x, y - 4f, 28f, humanAura)

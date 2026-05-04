@@ -19,9 +19,8 @@ import com.tankbriga.engine.network.PlayerSlot
 import com.tankbriga.engine.network.ShotResolvePacket
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.*
 
 class GameView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -53,6 +52,14 @@ class GameView @JvmOverloads constructor(
     private var ghostJob: Job? = null
     private var gameTickJob: Job? = null
 
+    private var gameSpeed = 1.0f
+    private var targetGameSpeed = 1.0f
+    private var timeSlowUntilMs = 0L
+    private var tickAccumulator = 0f
+    private var tickAccumulatorRender = 0f
+    private var damageFlashFrames = 0
+    private var vignettePaint: Paint? = null
+
     private var activeShotPath: List<Vector2>? = null
     private var activeShotResult: ShotResult? = null
     private var activeShotIndex = 0
@@ -76,6 +83,8 @@ class GameView @JvmOverloads constructor(
     private var lastImpactUntilMs = 0L
 
     private val floatingTexts = mutableListOf<DamageText>()
+    private val craterRings = CopyOnWriteArrayList<RingExpand>()
+    private val trailPath = Path()
 
     data class DamageText(
         val x: Float,
@@ -85,6 +94,21 @@ class GameView @JvmOverloads constructor(
         var life: Int = 80,
         val isCritical: Boolean = false,
         var vy: Float = -2.2f
+    )
+
+    data class RingExpand(
+        val x: Float,
+        val y: Float,
+        val maxRadius: Float,
+        var life: Int = 25
+    )
+
+    data class Cloud(
+        val x: Float,
+        val y: Float,
+        val w: Float,
+        val h: Float,
+        val speed: Float
     )
 
     private val damageTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -120,6 +144,12 @@ class GameView @JvmOverloads constructor(
         setColor(Color.rgb(255, 245, 170))
         style = Paint.Style.FILL
     }
+    private val explosionRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.WHITE
+    }
+    private val cloudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         setColor(Color.rgb(255, 255, 200))
         setAlpha(120)
@@ -538,7 +568,9 @@ class GameView @JvmOverloads constructor(
                 orchestrator.setWind(state.windState)
                 orchestrator.simulateShot(mockAction)
             }
+            val oldPath = ghostPath
             ghostPath = result.path
+            oldPath?.let { PathPool.release(it) }
         }
     }
 
@@ -548,10 +580,20 @@ class GameView @JvmOverloads constructor(
             while (isActive) {
                 val start = System.currentTimeMillis()
                 
-                // Fix 2 — Game loop separado do render thread
-                updateChargePower()
-                maybeAutoPlayBotTurn()
-                updateFlightAnimation()
+                // Fix: Time-slow effect
+                if (start > timeSlowUntilMs && targetGameSpeed < 1f) {
+                    targetGameSpeed = 1.0f
+                }
+                gameSpeed += (targetGameSpeed - gameSpeed) * 0.1f
+                
+                tickAccumulator += gameSpeed
+                while (tickAccumulator >= 1f) {
+                    // Fix 2 — Game loop separado do render thread
+                    updateChargePower()
+                    maybeAutoPlayBotTurn()
+                    updateFlightAnimation()
+                    tickAccumulator -= 1f
+                }
                 
                 val elapsed = System.currentTimeMillis() - start
                 delay(max(1, 16 - elapsed))
@@ -665,6 +707,7 @@ class GameView @JvmOverloads constructor(
 
         syncWindIntoSimulation()
         turnManager?.stopCountdown()
+        ghostPath?.let { PathPool.release(it) }
         ghostPath = null
         state.phase = MatchPhase.FLIGHT
 
@@ -673,7 +716,10 @@ class GameView @JvmOverloads constructor(
             cam.mode = CameraMode.FOLLOW
         }
 
+        val oldPath = activeShotPath
         activeShotPath = null
+        oldPath?.let { PathPool.release(it) }
+        
         activeShotResult = null
         activeShotIndex = 0
         flightResolvePosted = false
@@ -687,7 +733,9 @@ class GameView @JvmOverloads constructor(
 
         viewScope.launch {
             val result = withContext(Dispatchers.Default) { orchestrator.simulateShot(action) }
+            val prevPath = activeShotPath
             activeShotPath = result.path
+            prevPath?.let { PathPool.release(it) }
             activeShotResult = result
             activeShotIndex = 0
             flightResolvePosted = false
@@ -722,7 +770,11 @@ class GameView @JvmOverloads constructor(
     private fun resolveImpact(result: ShotResult) {
         val state = gameState ?: return
         val mgr = networkManager
+        
+        val oldPath = activeShotPath
         activeShotPath = null
+        oldPath?.let { PathPool.release(it) }
+        
         activeShotResult = null
         activeShotIndex = 0
         flightResolvePosted = false
@@ -798,20 +850,32 @@ class GameView @JvmOverloads constructor(
             terrainRenderer?.syncFromTerrain(impactPoint.x.toInt(), impactPoint.y.toInt(), report.craterRadius)
             
             withContext(Dispatchers.Main) {
+                AudioSynthesizer.playExplosion(report.totalDamage)
                 particles.emitExplosion(impactPoint.x, impactPoint.y, report.craterRadius)
+                craterRings.add(RingExpand(impactPoint.x, impactPoint.y, report.craterRadius.toFloat()))
                 lastImpactPoint = impactPoint
                 lastImpactUntilMs = System.currentTimeMillis() + 1700L
 
                 if (report.hitSomeone) {
                     AudioSynthesizer.playTankHit()
                     val hitPlayer = report.damages.any { it.tankId == localPlayerId }
-                    if (hitPlayer) vibrate(300) else vibrate(60)
+                    if (hitPlayer) {
+                        vibrate(300)
+                        damageFlashFrames = 2
+                    } else {
+                        vibrate(60)
+                    }
                 } else {
                     AudioSynthesizer.playMiss()
                     vibrate(100)
                 }
 
-                if (report.eliminated.isNotEmpty()) AudioSynthesizer.playDeath()
+                if (report.eliminated.isNotEmpty()) {
+                    AudioSynthesizer.playDeath()
+                    targetGameSpeed = 0.15f
+                    gameSpeed = 0.15f
+                    timeSlowUntilMs = System.currentTimeMillis() + 400L
+                }
 
                 camera?.focusOn(impactPoint, 1.45f)
                 camera?.triggerShake(if (report.hitSomeone) 30f else 20f, 20)
@@ -971,6 +1035,8 @@ class GameView @JvmOverloads constructor(
     private var skyPaint: Paint? = null
     private val starPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { setColor(Color.WHITE); setAlpha(140) }
     private var stars: List<Vector2>? = null
+    private var clouds1: List<Cloud>? = null
+    private var clouds2: List<Cloud>? = null
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         val state = gameState ?: return
@@ -988,8 +1054,24 @@ class GameView @JvmOverloads constructor(
         val skyGradient = LinearGradient(0f, 0f, 0f, height.toFloat(), Color.rgb(4, 8, 16), Color.rgb(20, 30, 60), Shader.TileMode.CLAMP)
         skyPaint = Paint().apply { shader = skyGradient }
         
+        vignettePaint = Paint().apply {
+            shader = RadialGradient(width / 2f, height / 2f, width * 0.7f, 
+                Color.TRANSPARENT, Color.rgb(200, 0, 0), Shader.TileMode.CLAMP)
+        }
+
         // Fix 9 — Star bitmap screen-space + 6× menor
         stars = List(120) { Vector2((Math.random() * width).toFloat(), (Math.random() * height).toFloat()) }
+        
+        // Fix: Parallax clouds
+        val ww = state.terrain.width.toFloat()
+        clouds1 = List(15) { 
+            Cloud((Math.random() * ww).toFloat(), (Math.random() * height * 0.5).toFloat() + height * 0.1f,
+                (Math.random() * 150 + 100).toFloat(), (Math.random() * 30 + 20).toFloat(), 0.2f)
+        }
+        clouds2 = List(10) {
+            Cloud((Math.random() * ww).toFloat(), (Math.random() * height * 0.4).toFloat() + height * 0.1f,
+                (Math.random() * 200 + 150).toFloat(), (Math.random() * 40 + 25).toFloat(), 0.4f)
+        }
     }
 
     private fun vibrate(ms: Long) {
@@ -1002,7 +1084,11 @@ class GameView @JvmOverloads constructor(
         val cam = camera ?: return
         val playersSnapshot = synchronized(state.players) { state.players.toList() }
 
-        particles.update()
+        tickAccumulatorRender += gameSpeed
+        while (tickAccumulatorRender >= 1f) {
+            particles.update()
+            tickAccumulatorRender -= 1f
+        }
 
         cam.update()
         skyPaint?.let { canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), it) }
@@ -1011,10 +1097,40 @@ class GameView @JvmOverloads constructor(
         stars?.forEach { canvas.drawCircle(it.x, it.y, 1.5f, starPaint) }
 
         cam.applyTransform(canvas)
+        
+        // Draw parallax clouds
+        cloudPaint.alpha = 40
+        val cx = cam.posX
+        val cy = cam.posY
+        val ww = state.terrain.width.toFloat()
+        clouds1?.forEach { c -> 
+            val drawX = (c.x - cx * c.speed) % ww
+            val finalX = if (drawX < -c.w) drawX + ww else drawX
+            canvas.drawRoundRect(finalX, c.y - cy * c.speed * 0.2f, finalX + c.w, c.y + c.h - cy * c.speed * 0.2f, c.h/2, c.h/2, cloudPaint)
+        }
+        cloudPaint.alpha = 70
+        clouds2?.forEach { c -> 
+            val drawX = (c.x - cx * c.speed) % ww
+            val finalX = if (drawX < -c.w) drawX + ww else drawX
+            canvas.drawRoundRect(finalX, c.y - cy * c.speed * 0.2f, finalX + c.w, c.y + c.h - cy * c.speed * 0.2f, c.h/2, c.h/2, cloudPaint)
+        }
+        
         terrainRenderer?.draw(canvas)
         drawGhostTrajectory(canvas, state)
         drawActiveProjectile(canvas)
         drawImpactMarker(canvas)
+
+        // Fix 2 — Ring de explosão
+        val ringIterator = craterRings.iterator()
+        while (ringIterator.hasNext()) {
+            val ring = ringIterator.next()
+            val alpha = (ring.life / 25f * 180).toInt().coerceIn(0, 180)
+            explosionRingPaint.alpha = alpha
+            val radius = ring.maxRadius * (1f - ring.life / 25f) * 1.4f
+            canvas.drawCircle(ring.x, ring.y, radius, explosionRingPaint)
+            ring.life--
+            if (ring.life <= 0) craterRings.remove(ring)
+        }
 
         // Update and draw floating texts
         val iterator = floatingTexts.iterator()
@@ -1050,8 +1166,25 @@ class GameView @JvmOverloads constructor(
                 tankRenderer.draw(canvas, tank, tank.color, tank.id == state.currentTurnPlayerId, aimAngle, tank.id == localPlayerId)
             }
         }
+        
         particles.draw(canvas)
         cam.restoreTransform(canvas)
+
+        // Damage Flash
+        if (damageFlashFrames > 0) {
+            canvas.drawColor(Color.argb(140, 255, 255, 255))
+            damageFlashFrames--
+        }
+
+        // Near-death Vignette
+        val myTank = state.players.find { it.id == localPlayerId }
+        if (myTank != null && myTank.hp in 1..20) {
+            val alpha = (sin(System.currentTimeMillis() / 150.0) * 40 + 80).toInt()
+            vignettePaint?.let {
+                it.alpha = alpha
+                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), it)
+            }
+        }
 
         hudRenderer.draw(
             canvas,
@@ -1109,17 +1242,25 @@ class GameView @JvmOverloads constructor(
         if (path.isEmpty()) return
         val index = activeShotIndex.coerceIn(0, path.lastIndex)
         val start = max(0, index - 80)
-        val trail = Path()
-        trail.moveTo(path[start].x, path[start].y)
-        for (i in start..index) trail.lineTo(path[i].x, path[i].y)
-        canvas.drawPath(trail, shotTrailPaint)
+
+        // Fix 3 — Reusar Path de trail
+        trailPath.rewind()
+        trailPath.moveTo(path[start].x, path[start].y)
+        for (i in start..index) trailPath.lineTo(path[i].x, path[i].y)
+        canvas.drawPath(trailPath, shotTrailPaint)
 
         val p = path[index]
         // Fix 4 — glowPaint pré-alocado
         canvas.drawCircle(p.x, p.y, 14f, glowPaint)
-        canvas.drawCircle(p.x, p.y, 8f, projectilePaint)
-    }
-    private fun drawImpactMarker(canvas: Canvas) {
+
+        // Fix 1 — Projétil oval rotacionado
+        val vel = if (index > 0) path[index] - path[index - 1] else Vector2(1f, 0f)
+        val angle = atan2(vel.y, vel.x)
+        canvas.save()
+        canvas.rotate(Math.toDegrees(angle.toDouble()).toFloat(), p.x, p.y)
+        canvas.drawOval(p.x - 12f, p.y - 5f, p.x + 12f, p.y + 5f, projectilePaint)
+        canvas.restore()
+    }    private fun drawImpactMarker(canvas: Canvas) {
         val point = lastImpactPoint ?: return
         val remaining = lastImpactUntilMs - System.currentTimeMillis()
         if (remaining <= 0L) return

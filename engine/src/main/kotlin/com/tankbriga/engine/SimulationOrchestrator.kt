@@ -50,7 +50,7 @@ class SimulationOrchestrator(
         var px = shooter.position.x + cosA * spawnOffset
         var py = shooter.position.y - sinA * spawnOffset
 
-        val path = ArrayList<Vector2>(800)
+        val path = PathPool.borrow()
         path.add(VectorPool.borrow(px, py))
 
         var bouncesLeft = config.bounces

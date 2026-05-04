@@ -3,7 +3,11 @@ package com.tankbriga.app.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlin.math.sin
+import kotlin.random.Random
 
 /**
  * Generates procedural audio waves using AudioTrack.
@@ -11,47 +15,106 @@ import kotlin.math.sin
  */
 object AudioSynthesizer {
     private const val SAMPLE_RATE = 44100
+    private val scope = CoroutineScope(Dispatchers.Default)
 
-    /** Plays a procedural "Whomp" sound for general explosions. */
-    fun playExplosion() {
-        playTone(100.0, 40.0, 350, waveType = "SINE", decay = true)
+    fun playExplosion(damage: Int = 20) {
+        scope.launch {
+            val durationMs = 400
+            val numSamples = (durationMs / 1000.0 * SAMPLE_RATE).toInt()
+            val samples = ShortArray(numSamples)
+            
+            // Pitch proporcional ao dano (mais dano = mais grave/lento)
+            val pitchMod = (1.0 - (damage.coerceIn(0, 100) / 100.0) * 0.5).toFloat()
+            var filterState = 0f
+            
+            for (i in 0 until numSamples) {
+                val progress = i.toDouble() / numSamples
+                val noise = Random.nextFloat() * 2f - 1f
+                
+                // Passa-baixa simples
+                filterState += (noise - filterState) * (0.1f * pitchMod)
+                
+                val amplitude = (1.0 - progress) * 28000
+                samples[i] = (amplitude * filterState).toInt().toShort()
+            }
+            playSamples(samples)
+        }
     }
 
-    /** Plays a metallic "Click" for shots. */
     fun playShot() {
-        playTone(500.0, 300.0, 60, waveType = "SQUARE", decay = true)
+        scope.launch {
+            val durationMs = 80
+            val numSamples = (durationMs / 1000.0 * SAMPLE_RATE).toInt()
+            val samples = ShortArray(numSamples)
+            
+            var filterState = 0f
+            for (i in 0 until numSamples) {
+                val progress = i.toDouble() / numSamples
+                val noise = Random.nextFloat() * 2f - 1f
+                
+                // Envelope ADSR muito curto
+                val env = if (progress < 0.1) progress / 0.1 else (1.0 - (progress - 0.1) / 0.9)
+                
+                // Filtro passa-banda simples para dar um 'pop'
+                filterState += (noise - filterState) * 0.5f
+                
+                samples[i] = (env * 25000 * filterState).toInt().toShort()
+            }
+            playSamples(samples)
+        }
     }
 
-    /** Plays a high-pitched "Ping" for hits on other tanks. */
     fun playTankHit() {
-        playTone(1200.0, 800.0, 150, waveType = "SINE", decay = true)
+        scope.launch { playTone(440.0, 440.0, 60, "SINE", true) }
     }
 
-    /** Plays a dramatic descending tone for player death. */
     fun playDeath() {
-        playTone(400.0, 50.0, 800, waveType = "SAWTOOTH", decay = true)
+        scope.launch {
+            val durationMs = 800
+            val numSamples = (durationMs / 1000.0 * SAMPLE_RATE).toInt()
+            val samples = ShortArray(numSamples)
+            
+            var phase1 = 0.0
+            var phase2 = 0.0
+            var filterState = 0f
+            
+            for (i in 0 until numSamples) {
+                val progress = i.toDouble() / numSamples
+                val freq1 = 400.0 - progress * 300.0
+                val freq2 = 300.0 - progress * 200.0
+                
+                val noise = Random.nextFloat() * 2f - 1f
+                filterState += (noise - filterState) * 0.05f
+                
+                val sig = (sin(phase1) + sin(phase2) + filterState * 1.5) / 3.0
+                
+                val amplitude = (1.0 - progress) * 30000
+                samples[i] = (amplitude * sig).toInt().toShort()
+                
+                phase1 += 2.0 * Math.PI * freq1 / SAMPLE_RATE
+                phase2 += 2.0 * Math.PI * freq2 / SAMPLE_RATE
+            }
+            playSamples(samples)
+        }
     }
 
-    /** Plays a high-pitched notification for turn start. */
     fun playTurnStart() {
-        playTone(880.0, 1000.0, 100, waveType = "SINE", decay = false)
+        scope.launch { playTone(880.0, 1000.0, 100, waveType = "SINE", decay = false) }
     }
 
-    /** Plays a gritty, audible "Fail" sound for misses. */
     fun playMiss() {
-        playTone(220.0, 110.0, 500, waveType = "SAWTOOTH", decay = true)
+        scope.launch { playTone(220.0, 110.0, 500, waveType = "SAWTOOTH", decay = true) }
     }
 
-    /** Plays a subtle 'Tick' for UI/Angle adjustments. */
     fun playTick() {
-        playTone(2000.0, 1800.0, 20, waveType = "SINE", decay = true, volume = 0.3f)
+        scope.launch { playTone(2000.0, 1800.0, 20, waveType = "SINE", decay = true, volume = 0.3f) }
     }
 
-    /** Plays a rising pitch tone for charging power. */
     fun playCharge(power: Float) {
-        // Map 0-100 power to 200Hz - 800Hz
-        val freq = 200.0 + (power * 6.0)
-        playTone(freq, freq + 20.0, 50, waveType = "SINE", decay = false, volume = 0.4f)
+        scope.launch {
+            val freq = 200.0 + (power * 6.0)
+            playTone(freq, freq + 20.0, 50, waveType = "SINE", decay = false, volume = 0.4f)
+        }
     }
 
     private fun playTone(
@@ -84,7 +147,10 @@ object AudioSynthesizer {
             
             phase += 2.0 * Math.PI * freq / SAMPLE_RATE
         }
-
+        playSamples(samples)
+    }
+    
+    private fun playSamples(samples: ShortArray) {
         try {
             val audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(AudioAttributes.Builder()
@@ -103,7 +169,7 @@ object AudioSynthesizer {
             audioTrack.write(samples, 0, samples.size)
             audioTrack.play()
             
-            val releaseTime = durationMs + 50L
+            val releaseTime = (samples.size.toDouble() / SAMPLE_RATE * 1000.0).toLong() + 50L
             Thread {
                 try {
                     Thread.sleep(releaseTime)
